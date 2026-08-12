@@ -99,7 +99,8 @@ writeFileSync(join(appHome, "config.json"), `${JSON.stringify(config, null, 2)}\
 writeFileSync(config.storageStatePath, "{}\n", { mode: 0o600 });
 
 const env = { ...process.env, CODEX_CHATGPT_WEB_HOME: appHome, CODEX_HOME: codexHome };
-const child = Bun.spawn(runtimeCommand([process.platform === "win32" ? "session" : "serve"]), {
+const foregroundSession = process.platform === "win32" || process.platform === "linux";
+const child = Bun.spawn(runtimeCommand([foregroundSession ? "session" : "serve"]), {
   env,
   stdout: "pipe",
   stderr: "pipe",
@@ -238,7 +239,7 @@ try {
     }
   }
 
-  if ((process.platform === "darwin" || process.platform === "win32") && existsSync(config.chromeExecutablePath)) {
+  if ((process.platform === "darwin" || process.platform === "win32" || process.platform === "linux") && existsSync(config.chromeExecutablePath)) {
     const browser = Bun.spawn(runtimeCommand(["browser", "check"]), { env, stdout: "pipe", stderr: "pipe" });
     const browserExit = await Promise.race([
       browser.exited,

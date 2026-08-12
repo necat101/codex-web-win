@@ -95,6 +95,8 @@ function assertMacOs(): void {
   if (process.platform !== "darwin") {
     const guidance = process.platform === "win32"
       ? "Windows intentionally uses a foreground, session-owned runtime; run `codex-chatgpt-web session`."
+      : process.platform === "linux"
+        ? "Linux uses a foreground, session-owned runtime; run `codex-chatgpt-web session`."
       : "Managed background services are available on macOS only; run `codex-chatgpt-web serve` manually on this platform.";
     throw new Error(guidance);
   }

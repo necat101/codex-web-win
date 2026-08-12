@@ -56,7 +56,7 @@ async function inspectStoredState(
 ): Promise<{ proAvailable: boolean; url: string }> {
   const verifierBrowser = await chromium.launch({
     executablePath: config.chromeExecutablePath,
-    headless: false,
+    headless: !config.headed,
     env: childProcessEnvironment(),
     ignoreDefaultArgs: ["--password-store=basic", "--use-mock-keychain"],
     args: ["--no-first-run", "--no-default-browser-check"],
@@ -216,6 +216,12 @@ export async function loginToChatGpt(
   if (!existsSync(config.chromeExecutablePath)) {
     throw new Error(`Google Chrome was not found at ${config.chromeExecutablePath}. Pass --chrome with its executable path.`);
   }
+  if (process.platform === "linux" && !process.env.DISPLAY && !process.env.WAYLAND_DISPLAY) {
+    throw new Error(
+      "Interactive ChatGPT login needs a Linux graphical session (DISPLAY or WAYLAND_DISPLAY). "
+      + "Run setup/login once from a desktop session, then reuse the stored browser state for headless turns.",
+    );
+  }
 
   const profileDir = join(
     dirname(config.storageStatePath),
@@ -252,7 +258,7 @@ export async function loginToChatGpt(
     process.stdout.write("Login Chrome closed; extracting ChatGPT session state...\n");
     context = await chromium.launchPersistentContext(profileDir, {
       executablePath: config.chromeExecutablePath,
-      headless: false,
+      headless: !config.headed,
       env: childProcessEnvironment(),
       ignoreDefaultArgs: ["--password-store=basic", "--use-mock-keychain"],
       args: ["--no-first-run", "--no-default-browser-check"],

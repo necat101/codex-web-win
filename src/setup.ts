@@ -19,6 +19,7 @@ export interface SetupOptions {
   mode: RuntimeMode;
   port?: number;
   chromeExecutablePath?: string;
+  headed?: boolean;
   appName?: string;
   forceLogin?: boolean;
   autoApproveToolCalls?: boolean;
@@ -142,6 +143,7 @@ function baseConfig(existing: AppConfig | undefined, options: SetupOptions): App
     config.port = options.port;
   }
   if (options.chromeExecutablePath) config.chromeExecutablePath = options.chromeExecutablePath;
+  if (options.headed !== undefined) config.headed = options.headed;
   if (options.appName) config.appName = options.appName;
   if (options.autoApproveToolCalls !== undefined) config.autoApproveToolCalls = options.autoApproveToolCalls;
   if (options.acknowledgedUnofficial) config.acknowledgedUnofficialAt = new Date().toISOString();
@@ -179,8 +181,8 @@ async function configureTunnel(config: AppConfig, existing: AppConfig | undefine
 }
 
 export async function setup(options: SetupOptions): Promise<SetupResult> {
-  if (process.platform !== "darwin" && process.platform !== "win32") {
-    throw new Error("Automated setup currently supports macOS and Windows only.");
+  if (process.platform !== "darwin" && process.platform !== "win32" && process.platform !== "linux") {
+    throw new Error("Automated setup currently supports macOS, Windows, and Linux only.");
   }
   const managedServices = process.platform === "darwin";
   const existing = loadExistingConfig();
@@ -233,8 +235,9 @@ export async function setup(options: SetupOptions): Promise<SetupResult> {
   if (!beforeService.loaded) await assertPortAvailable(config.host, config.port);
   let previousTunnelStopped = false;
   if (!managedServices && existing?.mode === "full" && existsSync(existing.tunnel!.binaryPath)) {
-    // A prior Windows launcher may have been interrupted before its graceful
-    // cleanup ran. Setup never adopts that runtime and never leaves it behind.
+    // A prior foreground launcher may have been interrupted before its
+    // graceful cleanup ran. Setup never adopts that runtime and never leaves
+    // it behind.
     stopTunnel(existing);
     previousTunnelStopped = true;
   }
@@ -247,16 +250,17 @@ export async function setup(options: SetupOptions): Promise<SetupResult> {
   }
   removeLegacyRuntimeArtifacts(config);
 
-  // Windows deliberately has no boot/logon task. The `session` command owns
-  // the proxy, tunnel runtime, and browser descendants, and setup leaves all
-  // of them stopped when it returns.
+  // Foreground-owned platforms deliberately have no boot/logon task. The
+  // `session` command owns the proxy, tunnel runtime, and browser descendants,
+  // and setup leaves all of them stopped when it returns.
   let tunnelReady: boolean | null = config.mode === "full" && !managedServices ? false : null;
   if (config.mode === "browser-only" && existing?.mode === "full") {
     if (managedServices) {
       const previousTunnelService = getTunnelServiceStatus();
       if (previousTunnelService.installed || previousTunnelService.loaded) await uninstallTunnelService();
     }
-    // Windows already performed this cleanup before saving the new config.
+    // Foreground-owned platforms already performed this cleanup before saving
+    // the new config.
     // If an old client was removed by an upgrade, there is no executable left
     // to stop and retiring the stale Full-mode configuration must still work.
     if (!previousTunnelStopped && existsSync(existing.tunnel!.binaryPath)) stopTunnel(existing);

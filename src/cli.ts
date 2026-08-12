@@ -54,6 +54,8 @@ Setup options:
   --full                       Fixed Instant–Extra High tool models plus read-only Pro
   --port NUMBER                Loopback Responses port (default: 17841)
   --chrome PATH                Google Chrome executable
+  --headless                   Run controlled browser turns without a visible window
+  --headed                     Keep controlled browser turns visible (debugging)
   --app-name NAME              ChatGPT connector name (default: Codex Native)
   --tunnel-id ID               Existing OpenAI tunnel id (full mode)
   --runtime-key-file PATH      File containing a Tunnels Read+Use runtime key
@@ -133,7 +135,12 @@ async function setupCommand(args: string[]): Promise<void> {
   const tunnelId = takeOption(args, "--tunnel-id");
   const runtimeKeyFile = takeOption(args, "--runtime-key-file");
   const chrome = takeOption(args, "--chrome");
+  const headless = takeFlag(args, "--headless");
+  const headed = takeFlag(args, "--headed");
+  if (headless && headed) throw new Error("Choose at most one browser display mode: --headless or --headed");
   if (chrome) options.chromeExecutablePath = chrome;
+  if (headless) options.headed = false;
+  if (headed) options.headed = true;
   if (appName) options.appName = appName;
   if (tunnelId) options.tunnelId = tunnelId;
   if (runtimeKeyFile) options.runtimeKeyFile = runtimeKeyFile;
@@ -181,6 +188,9 @@ async function setupCommand(args: string[]): Promise<void> {
     stdout.write("Start the on-demand runtime from the Codex ChatGPT Web desktop app.\n");
     stdout.write("Advanced users can instead run `codex-chatgpt-web session` in an independent terminal.\n");
     stdout.write("Windows startup remains disabled; closing the app or session stops the proxy and all descendants.\n");
+  } else if (process.platform === "linux") {
+    stdout.write("Linux uses a foreground-owned runtime; run `codex-chatgpt-web session` while using the ChatGPT Web models.\n");
+    stdout.write("Linux defaults to headless controlled browser turns; use `--headed` during setup when debugging browser UI changes.\n");
   }
   stdout.write("Restart the Codex app once so its native model catalog refreshes through the installed route.\n");
 }
@@ -421,8 +431,8 @@ async function main(): Promise<void> {
   } else if (command === "gui") await guiCommand(args);
   else if (command === "session") {
     assertNoArgs(args);
-    if (process.platform !== "win32") {
-      throw new Error("The foreground `session` owner is for Windows; macOS uses its managed services.");
+    if (process.platform !== "win32" && process.platform !== "linux") {
+      throw new Error("The foreground `session` owner is for Windows and Linux; macOS uses its managed services.");
     }
     await runForeground(loadConfig(), true);
   } else if (command === "serve") {

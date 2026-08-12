@@ -15,6 +15,7 @@
   <img src="https://img.shields.io/badge/macOS-arm64%20%7C%20Intel-black?logo=apple" alt="macOS arm64 and Intel">
   <img src="https://img.shields.io/badge/Free_AI-no_API_fees-10a37f" alt="Free AI with no API fees">
   <img src="https://img.shields.io/badge/Windows-x64%20%7C%20ARM64-0078d4?logo=windows11" alt="Windows x64 and ARM64">
+  <img src="https://img.shields.io/badge/Linux-x64%20%7C%20ARM64-fcc624?logo=linux&logoColor=black" alt="Linux x64 and ARM64">
 </p>
 
 Pick **ChatGPT Web — Instant**, **Medium**, **High**, **Extra High**, or **Pro** in Codex's native
@@ -63,7 +64,7 @@ policies.
 
 ## Quick start
 
-Browser-only mode needs macOS or Windows, Google Chrome, and a ChatGPT account. It does not need an
+Browser-only mode needs macOS, Windows, or Linux, Google Chrome/Chromium, and a ChatGPT account. It does not need an
 API key, tunnel, OpenCodex, or a Playwright browser download.
 
 ### Windows
@@ -115,6 +116,36 @@ curl -fsSL https://github.com/miuuyy/codex-chatgpt-web/releases/latest/download/
 Sign in through the one Chrome window opened by setup, restart Codex once, and select a
 **ChatGPT Web — …** model. Pro appears only when it is available on the authenticated account.
 Normal macOS use starts automatically after login and does not require another terminal command.
+
+### Linux
+
+Linux support is source-first in this fork. Install Bun 1.3.11 plus a system Google Chrome or
+Chromium build, then run:
+
+```bash
+git clone https://github.com/cachenetworks/codex-web-win.git
+cd codex-web-win
+bun install --frozen-lockfile
+bun run src/cli.ts setup --browser-only --headless --acknowledge-unofficial
+bun run src/cli.ts session
+```
+
+Linux defaults to **headless** controlled browser turns. Keep `codex-chatgpt-web session` (or the
+equivalent `bun run src/cli.ts session` command from a source checkout) running while Codex is using
+the ChatGPT Web models. `Ctrl+C` stops the proxy, controlled browser, and full-mode tunnel cleanly.
+
+Authentication is the one intentional exception to headless operation: the first `setup`/`login`
+needs a graphical Linux session so you can sign in to ChatGPT normally. Once the verified storage
+state exists, capability checks and normal Codex turns can run headlessly. On a displayless server,
+authenticate in a trusted graphical environment first and securely place the resulting
+`~/.codex-chatgpt-web/browser/storage-state.json` and adjacent `.verified.json` marker in the same
+private paths before running setup. Treat the storage-state file like a credential and keep it mode
+`0600`.
+
+Common Linux Chrome locations are detected automatically, including `google-chrome-stable`,
+`google-chrome`, `chromium`, `chromium-browser`, and Snap Chromium. `CHROME_BIN`, `CHROME_PATH`, or
+`--chrome /absolute/path` can override discovery. Use `--headed` during setup if you want normal
+browser turns visible while debugging ChatGPT UI changes.
 
 ## Modes
 

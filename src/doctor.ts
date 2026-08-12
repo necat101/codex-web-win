@@ -86,6 +86,11 @@ export async function runDoctor(): Promise<DoctorReport> {
   } else {
     checks.push({ id: "chrome", status: "ok", message: `Chrome executable found: ${config.chromeExecutablePath}` });
   }
+  checks.push({
+    id: "browser-mode",
+    status: "ok",
+    message: config.headed ? "Controlled browser turns are headed" : "Controlled browser turns are headless",
+  });
   if (!browserLoginStateExists(config)) {
     checks.push({ id: "login", status: "error", message: "ChatGPT login state is missing or unverified; run `codex-chatgpt-web login`" });
   } else if (!secureFile(config.storageStatePath)) {
@@ -112,7 +117,9 @@ export async function runDoctor(): Promise<DoctorReport> {
       status: "warning",
       message: process.platform === "win32"
         ? "Windows is foreground-only by design; keep the desktop app open (or run `codex-chatgpt-web session`) while using Codex"
-        : "Managed service is unavailable on this OS; keep `serve` running manually",
+        : process.platform === "linux"
+          ? "Linux is foreground-owned; keep `codex-chatgpt-web session` running while using Codex"
+          : "Managed service is unavailable on this OS; keep `serve` running manually",
     });
   } else if (!service.installed || !service.loaded) {
     checks.push({ id: "service", status: "error", message: "Background service is not installed and loaded" });
@@ -151,7 +158,9 @@ export async function runDoctor(): Promise<DoctorReport> {
           status: "warning",
           message: process.platform === "win32"
             ? "Tunnel runtime is owned by the foreground Windows session"
-            : "Managed tunnel service is unavailable on this OS",
+            : process.platform === "linux"
+              ? "Tunnel runtime is owned by the foreground Linux session"
+              : "Managed tunnel service is unavailable on this OS",
         }
       : tunnelService.installed && tunnelService.loaded && tunnelService.running
         ? { id: "tunnel-service", status: "ok", message: "Tunnel service is installed, loaded, and running" }

@@ -98,6 +98,10 @@ export function atomicWriteFile(path: string, data: string | Uint8Array): void {
   try { chmodSync(path, 0o600); } catch { /* Windows ACLs are managed by the installer. */ }
 }
 
+export function defaultBrowserHeaded(platform: NodeJS.Platform = process.platform): boolean {
+  return platform !== "linux";
+}
+
 export function defaultConfig(mode: RuntimeMode = "browser-only"): AppConfig {
   const home = getConfigDir();
   return {
@@ -111,7 +115,10 @@ export function defaultConfig(mode: RuntimeMode = "browser-only"): AppConfig {
     chromeExecutablePath: defaultChromeExecutable(),
     storageStatePath: join(home, "browser", "storage-state.json"),
     brokerSocketPath: defaultBrokerSocketPath(),
-    headed: true,
+    // Linux is primarily a server/headless target. Setup still opens one
+    // normal Chrome window when an interactive ChatGPT login is required,
+    // then the stored session is reused by headless Playwright turns.
+    headed: defaultBrowserHeaded(),
     proAvailable: false,
     autoApproveToolCalls: false,
     controlToken: randomBytes(32).toString("base64url"),
@@ -229,6 +236,20 @@ export function defaultChromeExecutable(
     const installed = candidates.find(candidate => existsSync(candidate));
     return installed ?? candidates[0]
       ?? "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe";
+  }
+  if (platform === "linux") {
+    const candidates = [
+      environment.CHROME_PATH,
+      environment.CHROME_BIN,
+      "/usr/bin/google-chrome-stable",
+      "/usr/bin/google-chrome",
+      "/usr/bin/chromium",
+      "/usr/bin/chromium-browser",
+      "/snap/bin/chromium",
+    ].filter((candidate): candidate is string => Boolean(candidate?.trim()));
+    return candidates.find(candidate => existsSync(candidate))
+      ?? candidates[0]
+      ?? "/usr/bin/google-chrome";
   }
   return "/usr/bin/google-chrome";
 }

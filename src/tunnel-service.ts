@@ -46,6 +46,8 @@ function assertMacOs(): void {
   if (process.platform !== "darwin") {
     const guidance = process.platform === "win32"
       ? "Windows intentionally runs the tunnel inside `codex-chatgpt-web session`; no background tunnel service is installed"
+      : process.platform === "linux"
+        ? "Linux runs the tunnel inside `codex-chatgpt-web session`; no background tunnel service is installed"
       : "Managed tunnel service installation is currently supported on macOS only";
     throw new Error(guidance);
   }

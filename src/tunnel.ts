@@ -243,9 +243,9 @@ export async function negotiateTunnelSession(operations: TunnelSessionOperations
  * Start the tunnel runtime as a descendant of the current session launcher.
  *
  * The Windows package launcher assigns the process tree to a kill-on-close Job
- * Object. That hard boundary covers terminal closure and launcher crashes even
- * after the short-lived `runtimes connect` command exits; the explicit stop
- * path remains responsible for normal graceful shutdown.
+ * Object. Linux relies on the foreground session's normal signal/shutdown path.
+ * In both cases the explicit stop path remains responsible for graceful
+ * shutdown.
  */
 export async function startTunnelSession(config: AppConfig, timeoutMs = 30_000): Promise<TunnelSession> {
   if (activeTunnelSession || tunnelSessionStarting) {
@@ -343,14 +343,14 @@ export function tunnelStatus(config: AppConfig): TunnelRuntimeStatus {
   const result = runCommand(settings.binaryPath, ["runtimes", "status", settings.alias, "--json"]);
   let output = (result.stdout || result.stderr).trim();
   const service = getTunnelServiceStatus();
-  if (result.status === 0 && (service.running || process.platform === "win32")) {
+  const foregroundOwned = process.platform === "win32" || process.platform === "linux";
+  if (result.status === 0 && (service.running || foregroundOwned)) {
     try {
       const parsed = JSON.parse(output) as Record<string, unknown>;
       // `runtimes status` probes the configured health and readiness endpoints
-      // on every call. A foreground Windows runtime outlives the short
-      // `runtimes connect` command while remaining inside the package
-      // launcher's Job Object, so a successful live probe is stronger evidence
-      // than stale supervisor PID metadata.
+      // on every call. A foreground runtime can outlive the short
+      // `runtimes connect` command, so a successful live probe is stronger
+      // evidence than stale supervisor PID metadata.
       if (service.running || (parsed.healthy === true && parsed.ready === true)) {
         parsed.process_running = true;
       }

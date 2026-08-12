@@ -45,6 +45,7 @@ export function externalUrlOpenCommand(
       args: ["url.dll,FileProtocolHandler", url],
     };
   }
+  if (platform === "linux") return { command: "xdg-open", args: [url] };
   return undefined;
 }
 
