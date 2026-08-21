@@ -4,7 +4,9 @@ import { dirname, join, resolve } from "node:path";
 import type { AppConfig } from "./config";
 import { atomicWriteFile, getConfigDir } from "./config";
 
-const JOURNAL_VERSION = 10 as const;
+const JOURNAL_VERSION = 12 as const;
+const LEGACY_CUSTOM_PROVIDER_JOURNAL_VERSION = 11 as const;
+const LEGACY_BASE_URL_JOURNAL_VERSION = 10 as const;
 const MANAGED_COMMENT = "# Managed by codex-chatgpt-web; `codex-chatgpt-web uninstall` restores prior values.";
 const MANAGED_PROVIDER_ID = "codex-chatgpt-web";
 
@@ -36,6 +38,30 @@ interface ProviderTable {
 
 export interface CodexIntegrationJournal extends Record<string, unknown> {
   version: typeof JOURNAL_VERSION;
+  configPath: string;
+  installed: {
+    model_provider: typeof MANAGED_PROVIDER_ID;
+    base_url: string;
+  };
+  previous: Record<ManagedAssignmentKey, PreviousAssignment>;
+  previousProviderBlock: PreviousProviderBlock;
+  migratedFromVersion?: number;
+}
+
+interface LegacyCodexIntegrationJournalV11 extends Record<string, unknown> {
+  version: typeof LEGACY_CUSTOM_PROVIDER_JOURNAL_VERSION;
+  configPath: string;
+  installed: {
+    model_provider: typeof MANAGED_PROVIDER_ID;
+    base_url: string;
+  };
+  previous: Record<ManagedAssignmentKey, PreviousAssignment>;
+  previousProviderBlock: PreviousProviderBlock;
+  migratedFromVersion?: number;
+}
+
+interface LegacyCodexIntegrationJournalV10 extends Record<string, unknown> {
+  version: typeof LEGACY_BASE_URL_JOURNAL_VERSION;
   configPath: string;
   installed: {
     openai_base_url: string;
@@ -275,6 +301,10 @@ function rawBlockLines(rawText: string): string[] {
   return body ? body.split(/\r?\n/) : [];
 }
 
+function trimTrailingBlankLines(lines: string[]): void {
+  while (lines.length > 0 && lines[lines.length - 1]!.trim() === "") lines.pop();
+}
+
 function restorePreviousAssignments(
   lines: string[],
   previous: Record<ManagedAssignmentKey, PreviousAssignment>,
@@ -316,6 +346,17 @@ function migrateSelectedAlias(lines: string[]): void {
   }
 }
 
+function managedProviderLines(installedUrl: string, requiresOpenAiAuth = true): string[] {
+  return [
+    `[model_providers.${MANAGED_PROVIDER_ID}]`,
+    `name = ${JSON.stringify(MANAGED_PROVIDER_ID)}`,
+    `base_url = ${JSON.stringify(installedUrl)}`,
+    'wire_api = "responses"',
+    `requires_openai_auth = ${requiresOpenAiAuth}`,
+    "supports_websockets = false",
+  ];
+}
+
 function installRoute(
   text: string,
   installedUrl: string,
@@ -347,7 +388,10 @@ function installRoute(
     insertion,
     0,
     MANAGED_COMMENT,
-    `openai_base_url = ${JSON.stringify(installedUrl)}`,
+    `model_provider = ${JSON.stringify(MANAGED_PROVIDER_ID)}`,
+    "",
+    ...managedProviderLines(installedUrl),
+    "",
   );
 
   return {
@@ -357,7 +401,79 @@ function installRoute(
   };
 }
 
-function verifyInstalledV10(text: string, journal: CodexIntegrationJournal): void {
+type CustomProviderJournal = CodexIntegrationJournal | LegacyCodexIntegrationJournalV11;
+
+function verifyInstalledCustomProvider(
+  text: string,
+  journal: CustomProviderJournal,
+  requiresOpenAiAuth: boolean,
+): void {
+  const { lines, lineEnding } = splitTomlLines(text);
+  const current = assignments(lines);
+  if (current.model_provider.value !== journal.installed.model_provider) {
+    throw new Error("Codex model_provider changed after setup and no longer points at the installed bridge route");
+  }
+  if (
+    current.openai_base_url.present
+    || current.chatgpt_base_url.present
+    || current.model_catalog_json.present
+  ) {
+    throw new Error("Conflicting Codex model-routing assignments are present");
+  }
+  const provider = findProviderTable(lines, lineEnding);
+  if (!provider) {
+    throw new Error(`Managed [model_providers.${MANAGED_PROVIDER_ID}] table is missing`);
+  }
+  const actualProvider = provider.rawText.replace(/\r\n/g, "\n").trim();
+  const expectedProvider = managedProviderLines(journal.installed.base_url, requiresOpenAiAuth).join("\n");
+  if (actualProvider !== expectedProvider) {
+    throw new Error(`Managed [model_providers.${MANAGED_PROVIDER_ID}] table changed after setup`);
+  }
+  if (!lines.includes(MANAGED_COMMENT)) {
+    throw new Error("Managed Codex route marker is missing");
+  }
+}
+
+function restoreCustomProvider(
+  text: string,
+  journal: CustomProviderJournal,
+  requiresOpenAiAuth: boolean,
+): string {
+  verifyInstalledCustomProvider(text, journal, requiresOpenAiAuth);
+  const { lines, lineEnding } = splitTomlLines(text);
+  const provider = findProviderTable(lines, lineEnding);
+  if (provider) lines.splice(provider.start, provider.end - provider.start);
+  removeManagedComments(lines);
+  removeTopLevelAssignments(lines, ["model_provider"]);
+  restorePreviousAssignments(lines, journal.previous);
+  if (journal.previousProviderBlock.present) {
+    if (!journal.previousProviderBlock.rawText) {
+      throw new Error("Codex integration journal is missing the prior provider block");
+    }
+    const previousLines = rawBlockLines(journal.previousProviderBlock.rawText);
+    const index = Math.min(journal.previousProviderBlock.index ?? lines.length, lines.length);
+    if (index > 0 && lines[index - 1]?.trim() !== "") previousLines.unshift("");
+    lines.splice(index, 0, ...previousLines);
+  }
+  trimTrailingBlankLines(lines);
+  return collapseBlankLines(withTrailingNewline(lines, lineEnding), lineEnding);
+}
+
+function restoreV11(text: string, journal: LegacyCodexIntegrationJournalV11): string {
+  try {
+    return restoreCustomProvider(text, journal, false);
+  } catch (legacyError) {
+    try {
+      // Also accept a manually repaired v11 route so setup can normalize its
+      // journal without requiring another destructive route replacement.
+      return restoreCustomProvider(text, journal, true);
+    } catch {
+      throw legacyError;
+    }
+  }
+}
+
+function verifyInstalledV10(text: string, journal: LegacyCodexIntegrationJournalV10): void {
   const { lines, lineEnding } = splitTomlLines(text);
   const current = assignments(lines);
   if (current.openai_base_url.value !== journal.installed.openai_base_url) {
@@ -378,7 +494,7 @@ function verifyInstalledV10(text: string, journal: CodexIntegrationJournal): voi
   }
 }
 
-function restoreV10(text: string, journal: CodexIntegrationJournal): string {
+function restoreV10(text: string, journal: LegacyCodexIntegrationJournalV10): string {
   verifyInstalledV10(text, journal);
   const { lines, lineEnding } = splitTomlLines(text);
   removeManagedComments(lines);
@@ -393,6 +509,7 @@ function restoreV10(text: string, journal: CodexIntegrationJournal): string {
     if (index > 0 && lines[index - 1]?.trim() !== "") previousLines.unshift("");
     lines.splice(index, 0, ...previousLines);
   }
+  trimTrailingBlankLines(lines);
   return collapseBlankLines(withTrailingNewline(lines, lineEnding), lineEnding);
 }
 
@@ -406,10 +523,32 @@ function readRawJournal(): Record<string, unknown> | undefined {
   return parsed as Record<string, unknown>;
 }
 
-function isV10Journal(value: Record<string, unknown> | undefined): value is CodexIntegrationJournal {
+function isV12Journal(value: Record<string, unknown> | undefined): value is CodexIntegrationJournal {
   return Boolean(
     value
     && value.version === JOURNAL_VERSION
+    && value.installed
+    && value.previous
+    && value.previousProviderBlock
+    && typeof value.configPath === "string",
+  );
+}
+
+function isV11Journal(value: Record<string, unknown> | undefined): value is LegacyCodexIntegrationJournalV11 {
+  return Boolean(
+    value
+    && value.version === LEGACY_CUSTOM_PROVIDER_JOURNAL_VERSION
+    && value.installed
+    && value.previous
+    && value.previousProviderBlock
+    && typeof value.configPath === "string",
+  );
+}
+
+function isV10Journal(value: Record<string, unknown> | undefined): value is LegacyCodexIntegrationJournalV10 {
+  return Boolean(
+    value
+    && value.version === LEGACY_BASE_URL_JOURNAL_VERSION
     && value.installed
     && value.previous
     && value.previousProviderBlock
@@ -424,9 +563,9 @@ function legacyJournalVersion(value: Record<string, unknown> | undefined): numbe
 }
 
 function backUpLegacyJournal(value: Record<string, unknown> | undefined): void {
-  if (!value || isV10Journal(value)) return;
+  if (!value || isV12Journal(value)) return;
   const path = getCodexJournalPath();
-  const backup = `${path}.pre-v10-${Date.now()}.bak`;
+  const backup = `${path}.pre-v12-${Date.now()}.bak`;
   copyFileSync(path, backup);
 }
 
@@ -440,17 +579,15 @@ export function installCodexIntegration(
   const existing = readRawJournal();
   const installedUrl = routeUrl(config);
 
-  if (isV10Journal(existing)) {
+  if (isV12Journal(existing)) {
     try {
-      verifyInstalledV10(currentText, existing);
-      const { lines, lineEnding } = splitTomlLines(currentText);
-      const current = findTopLevelAssignment(lines, "openai_base_url");
-      lines[current.index!] = `openai_base_url = ${JSON.stringify(installedUrl)}`;
+      const baseline = restoreCustomProvider(currentText, existing, true);
+      const repaired = installRoute(baseline, installedUrl, false);
       const updated: CodexIntegrationJournal = {
         ...existing,
-        installed: { openai_base_url: installedUrl },
+        installed: { model_provider: MANAGED_PROVIDER_ID, base_url: installedUrl },
       };
-      atomicWriteFile(configPath, withTrailingNewline(lines, lineEnding));
+      atomicWriteFile(configPath, repaired.text);
       atomicWriteFile(getCodexJournalPath(), `${JSON.stringify(updated, null, 2)}\n`);
       clearCodexModelCache();
       return updated;
@@ -465,13 +602,67 @@ export function installCodexIntegration(
       const repaired = installRoute(currentText, installedUrl, false);
       const updated: CodexIntegrationJournal = {
         ...existing,
-        installed: { openai_base_url: installedUrl },
+        installed: { model_provider: MANAGED_PROVIDER_ID, base_url: installedUrl },
       };
       atomicWriteFile(configPath, repaired.text);
       atomicWriteFile(getCodexJournalPath(), `${JSON.stringify(updated, null, 2)}\n`);
       clearCodexModelCache();
       return updated;
     }
+  }
+
+  if (isV11Journal(existing)) {
+    backUpLegacyJournal(existing);
+    let baseline: string;
+    try {
+      baseline = restoreV11(currentText, existing);
+    } catch (error) {
+      if (!options.replaceExistingRoute) {
+        const detail = error instanceof Error ? error.message : String(error);
+        throw new Error(`${detail}; rerun with --replace-codex-route to repair it`);
+      }
+      baseline = currentText;
+    }
+    const repaired = installRoute(baseline, installedUrl, false);
+    const updated: CodexIntegrationJournal = {
+      version: JOURNAL_VERSION,
+      configPath,
+      installed: { model_provider: MANAGED_PROVIDER_ID, base_url: installedUrl },
+      previous: existing.previous,
+      previousProviderBlock: existing.previousProviderBlock,
+      migratedFromVersion: LEGACY_CUSTOM_PROVIDER_JOURNAL_VERSION,
+    };
+    atomicWriteFile(configPath, repaired.text);
+    atomicWriteFile(getCodexJournalPath(), `${JSON.stringify(updated, null, 2)}\n`);
+    clearCodexModelCache();
+    return updated;
+  }
+
+  if (isV10Journal(existing)) {
+    backUpLegacyJournal(existing);
+    let baseline: string;
+    try {
+      baseline = restoreV10(currentText, existing);
+    } catch (error) {
+      if (!options.replaceExistingRoute) {
+        const detail = error instanceof Error ? error.message : String(error);
+        throw new Error(`${detail}; rerun with --replace-codex-route to repair it`);
+      }
+      baseline = currentText;
+    }
+    const repaired = installRoute(baseline, installedUrl, false);
+    const updated: CodexIntegrationJournal = {
+      version: JOURNAL_VERSION,
+      configPath,
+      installed: { model_provider: MANAGED_PROVIDER_ID, base_url: installedUrl },
+      previous: existing.previous,
+      previousProviderBlock: existing.previousProviderBlock,
+      migratedFromVersion: LEGACY_BASE_URL_JOURNAL_VERSION,
+    };
+    atomicWriteFile(configPath, repaired.text);
+    atomicWriteFile(getCodexJournalPath(), `${JSON.stringify(updated, null, 2)}\n`);
+    clearCodexModelCache();
+    return updated;
   }
 
   backUpLegacyJournal(existing);
@@ -491,7 +682,7 @@ export function installCodexIntegration(
   const journal: CodexIntegrationJournal = {
     version: JOURNAL_VERSION,
     configPath,
-    installed: { openai_base_url: installedUrl },
+    installed: { model_provider: MANAGED_PROVIDER_ID, base_url: installedUrl },
     previous: patched.previous,
     previousProviderBlock: patched.previousProviderBlock,
     ...(migratedFromVersion !== undefined ? { migratedFromVersion } : {}),
@@ -509,7 +700,11 @@ export function uninstallCodexIntegration(): UninstallCodexIntegrationResult {
   if (!existsSync(configPath)) throw new Error(`Codex config is missing: ${configPath}`);
   const current = readFileSync(configPath, "utf8");
 
-  if (isV10Journal(raw)) {
+  if (isV12Journal(raw)) {
+    atomicWriteFile(configPath, restoreCustomProvider(current, raw, true));
+  } else if (isV11Journal(raw)) {
+    atomicWriteFile(configPath, restoreV11(current, raw));
+  } else if (isV10Journal(raw)) {
     atomicWriteFile(configPath, restoreV10(current, raw));
   } else {
     const { lines, lineEnding } = splitTomlLines(current);
@@ -541,9 +736,9 @@ export function inspectCodexIntegration(): {
   const errors: string[] = [];
   if (journal) {
     try {
-      if (isV10Journal(journal)) {
+      if (isV12Journal(journal)) {
         const text = readFileSync(journal.configPath, "utf8");
-        verifyInstalledV10(text, journal);
+        verifyInstalledCustomProvider(text, journal, true);
       } else {
         errors.push("Legacy Codex route state will be repaired automatically when the bridge session starts");
       }
@@ -554,7 +749,13 @@ export function inspectCodexIntegration(): {
   return {
     installed: Boolean(journal),
     configPath: getCodexConfigPath(),
-    ...(isV10Journal(journal) ? { routeUrl: journal.installed.openai_base_url } : {}),
+    ...(isV12Journal(journal)
+      ? { routeUrl: journal.installed.base_url }
+      : isV11Journal(journal)
+        ? { routeUrl: journal.installed.base_url }
+        : isV10Journal(journal)
+          ? { routeUrl: journal.installed.openai_base_url }
+          : {}),
     ...(journal ? { journal } : {}),
     errors,
   };
