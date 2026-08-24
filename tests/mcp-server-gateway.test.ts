@@ -3,6 +3,7 @@ import type { CodexTool } from "../src/types";
 import type { ChatGptTurnEnvironment } from "../src/adapters/chatgpt-web/environment";
 import {
   gatewayNestedTools,
+  GatewayInventoryLastKnownGood,
   isPotentialNonOwnerBrokerError,
   execGatewayCommandProgram,
   execGatewayProgram,
@@ -32,6 +33,45 @@ function execGateway(description: string): CodexTool {
 }
 
 describe("Codex exec gateway discovery", () => {
+  test("retains the last non-empty gateway inventory across a transient empty refresh", () => {
+    const inventory = new GatewayInventoryLastKnownGood();
+    const declared = parseGatewayRuntimeTools([
+      { name: "apply_patch", description: "Apply a patch. This is a FREEFORM tool." },
+    ]);
+    const live = parseGatewayRuntimeTools([
+      { name: "apply_patch", description: "Apply a patch. This is a FREEFORM tool." },
+      { name: "exec_command", description: "Run a command." },
+    ]);
+
+    inventory.activate("binding-a", "fingerprint-a");
+    expect(inventory.preserve("binding-a", "fingerprint-a", live, declared)).toEqual(live);
+    expect(inventory.preserve("binding-a", "fingerprint-a", [], declared)).toEqual(live);
+  });
+
+  test("isolates last-known-good inventories by binding and advertised-tool fingerprint", () => {
+    const inventory = new GatewayInventoryLastKnownGood();
+    const fallback = parseGatewayRuntimeTools([
+      { name: "apply_patch", description: "Apply a patch. This is a FREEFORM tool." },
+    ]);
+    const live = parseGatewayRuntimeTools([
+      { name: "exec_command", description: "Run a command." },
+    ]);
+
+    inventory.activate("binding-a", "fingerprint-a");
+    inventory.preserve("binding-a", "fingerprint-a", live, fallback);
+
+    inventory.activate("binding-b", "fingerprint-a");
+    expect(inventory.preserve("binding-b", "fingerprint-a", [], fallback)).toEqual(fallback);
+
+    inventory.activate("binding-a", "fingerprint-b");
+    expect(inventory.preserve("binding-a", "fingerprint-b", [], fallback)).toEqual(fallback);
+
+    // A late completion from the invalidated fingerprint must not repopulate
+    // the currently active binding scope.
+    inventory.preserve("binding-a", "fingerprint-a", live, fallback);
+    expect(inventory.preserve("binding-a", "fingerprint-b", [], fallback)).toEqual(fallback);
+  });
+
   test("recognizes shared-tunnel ownership misses and hashes request scope values", () => {
     expect(isPotentialNonOwnerBrokerError(new Error("turn token is invalid, expired, or revoked"))).toBe(true);
     expect(isPotentialNonOwnerBrokerError(new Error("binding id is invalid or expired"))).toBe(true);
