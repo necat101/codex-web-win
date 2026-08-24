@@ -104,8 +104,8 @@ curl -fsSL https://github.com/miuuyy/codex-chatgpt-web/releases/latest/download/
 
 | 模式 | 模型 | 本地 Codex 工具 | 额外设置 |
 | --- | --- | --- | --- |
-| **仅浏览器** | Instant 到 Pro | 不可用；Codex 会显示警告 | 无 |
-| **完整 harness** | Instant 到 Pro | Instant–Extra High：可用；Pro：只读 | OpenAI 隧道 + ChatGPT 连接器 |
+| **仅浏览器** | ChatGPT Instant 到 Pro；可选 DeepSeek Instant/Expert | 不可用；Codex 会显示警告 | 可选独立 DeepSeek 登录 |
+| **完整 harness** | ChatGPT Instant 到 Pro；可选 DeepSeek Instant/Expert | ChatGPT Instant–Extra High：可用；ChatGPT Pro 和 DeepSeek：只读 | OpenAI 隧道 + ChatGPT 连接器；可选独立 DeepSeek 登录 |
 
 模型选择器中的每一项都对应一个固定的 ChatGPT 模式。Codex 仍会显示内置的 Effort 和 Speed
 选项，但更改它们不会在后台静默切换所选的浏览器模型。Pro 会收到 Codex 已经收集的完整上下文，
@@ -116,6 +116,29 @@ curl -fsSL https://github.com/miuuyy/codex-chatgpt-web/releases/latest/download/
 这样仅浏览器模式会安全地失败，而不会把任务静默切换到原生 Codex 后端。**完整 harness** 模式则
 继续保留原生模型目录和原生转发，并与 ChatGPT Web 模型同时可用。两种模式下，任务历史、审批、
 沙箱和工具结果仍由 Codex 管理。
+
+### 可选 DeepSeek Web
+
+DeepSeek Web 默认关闭。在 Windows 控制中心启用 **DeepSeek Web Instant and Expert models**，
+确认实验性自动化和独立数据边界，然后通过单独的 Chrome 配置正常登录 DeepSeek。DeepSeek 登录
+状态不会与 ChatGPT 登录状态共用。CLI 等效命令为：
+
+```bash
+codex-chatgpt-web setup --browser-only \
+  --deepseek-web \
+  --acknowledge-unofficial \
+  --acknowledge-deepseek
+```
+
+之后可用 `codex-chatgpt-web deepseek-login` 单独刷新登录。每一轮 DeepSeek 请求都会打开全新网页
+聊天并发送 Codex 本地展开后的完整对话历史，因此在压缩、重试、切换任务或切换模型后不会复用错误
+的网页会话。当前集成仅支持文本和只读回答；不支持图片、本地 shell/文件系统、MCP 工具、应用、
+文件上传或视觉。
+
+这属于实验性网页自动化，并非官方 DeepSeek API。DeepSeek 当前的
+[使用条款](https://cdn.deepseek.com/policies/en-US/deepseek-terms-of-use.html)限制自动抓取/复制，
+启用后可能给账户带来风险。本适配器不会绕过地区限制、WAF、CAPTCHA、登录或其他访问控制；遇到
+这些情况或 UI 漂移时会明确失败。
 
 ## 完整 harness
 

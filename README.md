@@ -22,6 +22,10 @@ model picker. The bridge sends the complete Codex task context to a fresh ChatGP
 attaches images, and streams visible reasoning, tool activity, and Markdown back into the same
 Codex task.
 
+An optional, separately authenticated **DeepSeek Web — Instant** and **DeepSeek Web — Expert**
+provider can also be enabled. It coexists with every ChatGPT Web and native GPT-5.6 Sol entry;
+selecting DeepSeek is always a manual choice and never an automatic refusal fallback.
+
 <p align="center">
   <img src="assets/demo.gif" alt="ChatGPT Web running inside the native Codex harness" width="960">
 </p>
@@ -72,6 +76,8 @@ Download the architecture-matching offline setup from the
 [latest release](https://github.com/miuuyy/codex-chatgpt-web/releases/latest):
 
 - `codex-chatgpt-web-windows-x64-setup.exe` for Intel/AMD Windows
+- `codex-chatgpt-web-windows-arm64-setup.exe` for Windows ARM64
+
 Double-click it, choose **Install**, and leave **Launch Codex ChatGPT Web now** checked. The native
 Windows control center handles both browser-only and full-harness setup; you do not need to run the
 setup CLI for normal use.
@@ -120,8 +126,8 @@ Normal macOS use starts automatically after login and does not require another t
 
 | Mode | Models | Local Codex tools | Extra setup |
 | --- | --- | --- | --- |
-| **Browser-only** | Instant through Pro | No; Codex shows a warning | None |
-| **Full harness** | Instant through Pro | Instant–Extra High: yes; Pro: read-only | OpenAI tunnel + ChatGPT connector |
+| **Browser-only** | ChatGPT Instant–Pro; optional DeepSeek Instant/Expert | No; Codex shows a warning | Optional separate DeepSeek login |
+| **Full harness** | ChatGPT Instant–Pro; optional DeepSeek Instant/Expert | ChatGPT Instant–Extra High and DeepSeek: yes; ChatGPT Pro: read-only | OpenAI tunnel + ChatGPT connector; optional separate DeepSeek login |
 
 Every picker entry has one fixed ChatGPT mode. Codex still displays its built-in Effort and Speed
 rows, but changing them cannot silently change the selected browser model. Pro receives the full
@@ -133,6 +139,43 @@ entries, and rejects native-model Responses/compaction passthrough. This makes b
 closed instead of silently switching a task onto the native Codex backend. **Full harness** mode
 keeps the native catalog entries and native passthrough available alongside the ChatGPT Web models.
 Task history, approvals, sandboxing, and tool results remain owned by Codex in both modes.
+
+### Optional DeepSeek Web
+
+DeepSeek Web is disabled by default. In the Windows control center, enable **DeepSeek Web Instant
+and Expert models**, accept its separate experimental-automation/data-boundary acknowledgement,
+then choose **Set up and sign in**. Setup opens an independent Chrome profile for DeepSeek; sign in
+normally, confirm the composer is visible, and close that dedicated window completely. Its cookies
+and verification marker are stored separately from the ChatGPT login.
+
+The CLI equivalent is:
+
+```bash
+codex-chatgpt-web setup --browser-only \
+  --deepseek-web \
+  --acknowledge-unofficial \
+  --acknowledge-deepseek
+```
+
+Refresh only that login later with `codex-chatgpt-web deepseek-login`. Disabling DeepSeek hides its
+models but deliberately retains the independent login state unless the harness's private data is
+removed during uninstall.
+
+Each DeepSeek round opens a fresh web chat and sends the locally expanded Codex conversation
+history. This prevents a browser conversation from drifting away from Codex after compaction,
+retry, task switching, or model switching. The integration is text-only, but in full-harness mode
+DeepSeek can request any tools advertised by the active Codex turn (including shell/filesystem and
+namespaced MCP/app tools). Codex executes those requests under the task's normal permissions and
+returns the tool results on the next round; DeepSeek never receives direct local access. DeepSeek
+Web search, file upload, and vision are not advertised because their current Web UI does not provide
+a stable automation contract.
+
+This is experimental browser automation, not a supported DeepSeek API integration. DeepSeek's
+[current Terms of Use](https://cdn.deepseek.com/policies/en-US/deepseek-terms-of-use.html) restrict
+automated capture/copying, so enabling it may put the DeepSeek account at risk. The adapter does not
+bypass regional restrictions, WAF challenges, CAPTCHA, login controls, or other access controls;
+those conditions fail explicitly. DeepSeek UI drift also fails closed rather than guessing at
+unverified controls.
 
 ## Full harness
 
@@ -154,9 +197,9 @@ foreground-owned, so keep the control center open whenever Codex is using the Ch
 4. Under **2. Advanced full-mode credentials**, paste the `tunnel_...` id into **Tunnel ID** and
    paste the runtime key into **Runtime key**. The key is passed to setup through redirected stdin;
    it is not placed in command-line arguments or GUI logs.
-5. Under **3. Connection details**, keep **Connector name** as `Codex Native` unless you intend to
-   use a different matching name in ChatGPT. The default port and detected Chrome path normally do
-   not need changing. Leave **Automatically click per-call Allow once prompts** off unless you
+5. Under **3. Connection details**, keep the prefilled machine-specific **Connector name** (for
+   example, `Codex Native LAPTOP-01`) unless you intend to use a different matching name in ChatGPT.
+   The default port and detected Chrome path normally do not need changing. Leave **Automatically click per-call Allow once prompts** off unless you
    explicitly want the bridge to accept those one-time prompts for you.
 6. Check the unofficial-software acknowledgement and choose **Set up and sign in**. When the
    dedicated Chrome window opens, sign in to ChatGPT, confirm the composer is visible, then close
@@ -171,6 +214,14 @@ foreground-owned, so keep the control center open whenever Codex is using the Ch
 9. Restart Codex once, then choose a **ChatGPT Web - ...** model in Codex. Instant through Extra
    High can call the current Codex task's local tools in full mode. Pro still receives the complete
    accumulated task context but cannot initiate these local MCP/tool calls.
+
+Use a different OpenAI tunnel and a uniquely named ChatGPT custom app/connector for every computer
+that may run Full mode at the same time (for example, `Codex Native Laptop` and `Codex Native
+Desktop`). A Codex turn capability is owned by the local broker on the computer where that task is
+running. If two computers poll the same tunnel, the control plane can deliver a call to the other
+computer, which cannot resolve that turn and reports `CODEX_SHARED_TUNNEL_ROUTE_MISS`. Retries are
+only a best-effort recovery from transient redundant polling; they are not a substitute for
+per-computer tunnel isolation.
 
 If you rerun or repair full-mode setup later, the GUI can reuse already configured tunnel
 credentials; leave a credential field blank when the control center says that saved value is
@@ -243,8 +294,9 @@ The commands below show the macOS release path:
      --acknowledge-unofficial
    ```
 
-5. While `doctor` reports ready, attach that tunnel to a ChatGPT connector named `Codex Native`
-   in [ChatGPT connector settings](https://chatgpt.com/#settings/Connectors), scan its tools, set
+5. While `doctor` reports ready, attach that tunnel to a ChatGPT connector using the exact
+   machine-specific name printed by setup (for example, `Codex Native LAPTOP-01`) in
+   [ChatGPT connector settings](https://chatgpt.com/#settings/Connectors), scan its tools, set
    the intended action permissions, and restart Codex once.
 
 Write/modify actions require a ChatGPT workspace and admin policy that permit them. OpenAI
