@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type {
   CodexAssistantMessage,
   CodexContentPart,
@@ -12,7 +13,7 @@ import type {
 } from "../types";
 import { namespacedToolName } from "../types";
 import { responsesRequestSchema } from "./schema";
-import { compactionItemToText } from "./compaction";
+import { compactionItemToText, isLocalCompactionPromptItem, isReadableCompactionSummaryText } from "./compaction";
 import { previousResponseReplayPrefixLength } from "./state";
 import { decodeReasoningEnvelope } from "./reasoning-envelope";
 import { extractHostedWebSearch, WEB_SEARCH_TOOL_NAME } from "../web-search/synthetic-tool";
@@ -243,6 +244,9 @@ export function parseRequest(body: unknown): CodexParsedRequest {
     throw new Error(`responses parse error: ${parsed.error.message}`);
   }
   const data = parsed.data;
+  // Zod intentionally normalizes supported fields and strips unknown wire metadata such as a
+  // message `id`. Keep the raw array alongside it for control-message authentication checks.
+  const rawInput = isObj(body) && Array.isArray(body.input) ? body.input : undefined;
   const now = Date.now();
   const messages: CodexMessage[] = [];
   const systemPrompt: string[] = [];
@@ -264,7 +268,18 @@ export function parseRequest(body: unknown): CodexParsedRequest {
   // Remote compaction v2: the input tail carries `{type:"compaction_trigger"}` and Codex expects a
   // synthetic `{type:"compaction"}` output item (src/responses/compaction.ts). Flagged for the server.
   let compactionRequest = false;
+  let localCompactionCandidate = false;
   let contextCompactionBoundary = false;
+  let contextCompactionEpoch: string | undefined;
+
+  const recordCompactionEpoch = (kind: string, material: unknown, newlyAppended: boolean): void => {
+    contextCompactionEpoch = createHash("sha256")
+      .update(kind)
+      .update("\0")
+      .update(typeof material === "string" ? material : JSON.stringify(material ?? null))
+      .digest("hex");
+    if (newlyAppended) contextCompactionBoundary = true;
+  };
 
   if (typeof data.instructions === "string" && data.instructions.length > 0) {
     systemPrompt.push(data.instructions);
@@ -276,6 +291,10 @@ export function parseRequest(body: unknown): CodexParsedRequest {
     for (let inputIndex = 0; inputIndex < data.input.length; inputIndex++) {
       const item = data.input[inputIndex];
       const effectiveType = (item as { type?: string }).type ?? ("role" in item ? "message" : undefined);
+
+      if (inputIndex >= replayedInputPrefixLength && isLocalCompactionPromptItem(rawInput?.[inputIndex] ?? item)) {
+        localCompactionCandidate = true;
+      }
 
       if (effectiveType === "compaction_trigger") {
         // A trigger restored from previous_response_id is historical input and
@@ -305,7 +324,7 @@ export function parseRequest(body: unknown): CodexParsedRequest {
         // is dropped silently. It must NOT flag _compactionRequest. Only a marker newly appended in
         // this request starts a provider-private context epoch; markers inside the prefix restored by
         // previous_response_id were already acknowledged on the turn that introduced them.
-        if (inputIndex >= replayedInputPrefixLength) contextCompactionBoundary = true;
+        recordCompactionEpoch(effectiveType, item, inputIndex >= replayedInputPrefixLength);
         const encrypted = (item as { encrypted_content?: unknown }).encrypted_content;
         if (effectiveType === "context_compaction" && typeof encrypted !== "string") continue;
         pendingReasoning.length = 0;
@@ -348,6 +367,15 @@ export function parseRequest(body: unknown): CodexParsedRequest {
 
       if (effectiveType === "message") {
         const msg = item as { role?: string; content?: unknown; phase?: "commentary" | "final_answer" };
+        if (msg.role === "user") {
+          const candidate = inputContentParts(msg.content as unknown[] | string | undefined);
+          const candidateText = typeof candidate === "string"
+            ? candidate
+            : candidate.map(part => part.type === "text" ? part.text : "").join("");
+          if (isReadableCompactionSummaryText(candidateText)) {
+            recordCompactionEpoch("readable-summary", candidateText, inputIndex >= replayedInputPrefixLength);
+          }
+        }
         switch (msg.role) {
           case "system": {
             pendingReasoning.length = 0;
@@ -565,6 +593,9 @@ export function parseRequest(body: unknown): CodexParsedRequest {
     messages,
     ...(mergedTools.length > 0 ? { tools: mergedTools } : {}),
   };
+  // Codex local auto-compaction deliberately sends no tools because it is a summarizer exchange.
+  // Keep the flag distinct from remote-v2: the two callers expect different response item shapes.
+  const localCompactionRequest = localCompactionCandidate && mergedTools.length === 0;
 
   const options: CodexRequestOptions = {};
   if (data.max_output_tokens !== undefined) options.maxOutputTokens = data.max_output_tokens;
@@ -610,7 +641,9 @@ export function parseRequest(body: unknown): CodexParsedRequest {
     ...(webSearch ? { _webSearch: webSearch } : {}),
     ...(structuredOutput ? { _structuredOutput: true } : {}),
     ...(compactionRequest ? { _compactionRequest: true } : {}),
+    ...(localCompactionRequest ? { _localCompactionRequest: true } : {}),
     ...(contextCompactionBoundary ? { _contextCompactionBoundary: true } : {}),
+    ...(contextCompactionEpoch ? { _contextCompactionEpoch: contextCompactionEpoch } : {}),
   };
 }
 

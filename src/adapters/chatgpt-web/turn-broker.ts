@@ -3,6 +3,7 @@ import { chmodSync, existsSync, lstatSync, mkdirSync, unlinkSync } from "node:fs
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { dirname } from "node:path";
 import { isWindowsNamedPipePath, resolveBrokerSocketPath } from "../../config";
+import { namespacedToolName, type CodexTool } from "../../types";
 import type { ChatGptTurnEnvironment } from "./environment";
 
 interface PendingTurn extends ChatGptTurnEnvironment {
@@ -48,6 +49,7 @@ interface PendingCountWaiter {
 
 interface TurnChannel {
   traceId: string;
+  ttlMs: number;
   environment: PendingTurn;
   bindingId?: string;
   queuedCallIds: string[];
@@ -97,6 +99,19 @@ function environmentIdentity(environment: ChatGptTurnEnvironment): string {
   });
 }
 
+/**
+ * Codex can elide the active tool declarations on later requests in the same
+ * native turn (notably while checkpointing a long tool loop). The broker token
+ * is already scoped to that one turn, so retain tools that were authoritatively
+ * advertised earlier and let newer declarations replace matching wire names.
+ */
+export function mergeActiveTurnTools(previous: CodexTool[], incoming: CodexTool[]): CodexTool[] {
+  const merged = new Map<string, CodexTool>();
+  for (const tool of previous) merged.set(namespacedToolName(tool.namespace, tool.name), tool);
+  for (const tool of incoming) merged.set(namespacedToolName(tool.namespace, tool.name), tool);
+  return [...merged.values()];
+}
+
 export class TurnBroker {
   static forSocket(path: string): TurnBroker {
     const endpoint = resolveBrokerSocketPath(path);
@@ -122,6 +137,7 @@ export class TurnBroker {
     const token = opaqueId("turn");
     const channel: TurnChannel = {
       traceId,
+      ttlMs,
       environment: { ...environment, expiresAt: Date.now() + ttlMs },
       queuedCallIds: [],
       invocations: new Map(),
@@ -133,19 +149,36 @@ export class TurnBroker {
     return token;
   }
 
-  updateEnvironment(token: string, environment: ChatGptTurnEnvironment): void {
+  /** Keep a demonstrably active browser turn's capability alive. */
+  renew(token: string): boolean {
+    const channel = this.channels.get(token);
+    if (!channel) return false;
+    this.touch(channel);
+    return true;
+  }
+
+  updateEnvironment(token: string, environment: ChatGptTurnEnvironment): PendingTurn {
     this.prune();
     const channel = this.channels.get(token);
     if (!channel) throw new Error("turn token is invalid or expired");
     if (environmentIdentity(channel.environment) !== environmentIdentity(environment)) {
       throw new Error("Codex turn environment changed during an active ChatGPT tool loop");
     }
-    channel.environment = { ...environment, expiresAt: channel.environment.expiresAt };
+    channel.environment = {
+      ...environment,
+      tools: mergeActiveTurnTools(channel.environment.tools, environment.tools),
+      expiresAt: channel.environment.expiresAt,
+    };
+    this.touch(channel);
+    return channel.environment;
   }
 
   pendingToolCount(token: string): number {
     this.prune();
-    return this.channels.get(token)?.invocations.size ?? 0;
+    const channel = this.channels.get(token);
+    if (!channel) return 0;
+    this.touch(channel);
+    return channel.invocations.size;
   }
 
   async waitForPendingToolCountChange(
@@ -157,6 +190,7 @@ export class TurnBroker {
     this.prune();
     const channel = this.channels.get(token);
     if (!channel) throw new Error("turn token is invalid or expired");
+    this.touch(channel);
     const current = channel.invocations.size;
     if (current !== previousCount || timeoutMs <= 0) return current;
     if (signal?.aborted) throw new DOMException("pending tool count wait aborted", "AbortError");
@@ -189,6 +223,7 @@ export class TurnBroker {
     this.prune();
     const channel = this.channels.get(token);
     if (!channel) throw new Error("turn token is invalid or expired");
+    this.touch(channel);
     const ready = this.takeQueued(channel);
     if (ready.length > 0) return ready;
     if (signal?.aborted) throw new DOMException("tool wait aborted", "AbortError");
@@ -209,6 +244,7 @@ export class TurnBroker {
     this.prune();
     const channel = this.channels.get(token);
     if (!channel) throw new Error("turn token is invalid or expired");
+    this.touch(channel);
     const invocation = channel.invocations.get(callId);
     if (!invocation) throw new Error(`tool call is not pending: ${callId}`);
     if (channel.queuedCallIds.includes(callId)) throw new Error(`tool call was completed before it was delivered: ${callId}`);
@@ -346,6 +382,7 @@ export class TurnBroker {
       const channel = this.channels.get(token);
       console.error(`[chatgpt-web] broker claim received (tokenChars=${token.length}, valid=${Boolean(channel)})`);
       if (!channel) throw new Error("turn token is invalid, expired, or revoked");
+      this.touch(channel);
       if (channel.bindingId) {
         const existing = this.bindings.get(channel.bindingId);
         if (!existing || existing.token !== token || existing.channel !== channel) {
@@ -368,6 +405,7 @@ export class TurnBroker {
       this.revoke(binding.token);
       return { released: true };
     }
+    this.touch(binding.channel);
     if (request.method === "resolve") return { environment: binding.channel.environment };
 
     const wireName = request.wireName?.trim();
@@ -443,6 +481,10 @@ export class TurnBroker {
     for (const waiter of [...channel.pendingCountWaiters]) waiter.reject(error);
     channel.pendingCountWaiters.clear();
     channel.queuedCallIds = [];
+  }
+
+  private touch(channel: TurnChannel): void {
+    channel.environment.expiresAt = Date.now() + channel.ttlMs;
   }
 
   private prune(): void {

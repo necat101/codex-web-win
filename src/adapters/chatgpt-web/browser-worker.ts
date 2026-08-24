@@ -4,6 +4,7 @@ import { join, resolve } from "node:path";
 import { chromium, type Browser, type BrowserContext, type CDPSession, type Locator, type Page } from "playwright-core";
 import { atomicWriteFile, defaultChromeExecutable, expandUserPath, getConfigDir } from "../../config";
 import type { CodexProviderConfig } from "../../types";
+import { browserComposerTextMatches, normalizeBrowserComposerText } from "../composer-text";
 import { parseDataUrl } from "../image";
 import { ChatGptMarkdownStream } from "./markdown";
 import { resolveChatGptWebModelMode, type ChatGptWebCapabilities, type ChatGptWebModelMode } from "./model";
@@ -15,11 +16,25 @@ import { childProcessEnvironment } from "../../process";
 
 const workers = new Map<string, ChatGptBrowserWorker>();
 
-export const DEFAULT_CHATGPT_TURN_TIMEOUT_MS = 40 * 60_000;
+// This is an inactivity budget, not a fixed wall-clock lifetime. Long-running
+// ChatGPT work can legitimately spend well over forty minutes in one turn, so
+// keep a generous bounded fallback while the more specific DOM/bridge
+// watchdogs detect actual failures much sooner.
+export const DEFAULT_CHATGPT_TURN_TIMEOUT_MS = 2 * 60 * 60_000;
 export const DEFAULT_CHATGPT_TOOL_TURN_TIMEOUT_MS = 3 * 60 * 60_000;
 const MAX_CHATGPT_DELIVERY_TIMEOUT_RECOVERIES = 6;
-export const CHATGPT_RESPONSE_DOM_GRACE_MS = 30_000;
+// ChatGPT can remount its assistant turn while a long reasoning pass is still
+// healthy. Thirty seconds proved too aggressive in production: a real 14m42s
+// task was cancelled during one of these remounts. Keep inspecting the page,
+// but only fail after a continuously observed, five-minute absence.
+export const CHATGPT_RESPONSE_DOM_GRACE_MS = 5 * 60_000;
+export const CHATGPT_RUNNING_WITHOUT_RESPONSE_GRACE_MS = 15 * 60_000;
 export const CHATGPT_EMPTY_RESPONSE_GRACE_MS = 10_000;
+export const CHATGPT_DOM_PROBE_GRACE_MS = 5 * 60_000;
+export const CHATGPT_POST_TOOL_COMPLETION_GRACE_MS = 5_000;
+export const CHATGPT_COMPLETION_OBSERVATION_GAP_MS = 10_000;
+export const CHATGPT_WATCHDOG_OBSERVATION_GAP_MS = 30_000;
+export const CHATGPT_MAX_SCHEDULER_GAP_EXTENSION_MS = 60 * 60_000;
 export const CHATGPT_RESPONSE_POLL_MS = 1_250;
 export const CHATGPT_TOOL_WAIT_POLL_MS = 15_000;
 export const CHATGPT_UI_POLL_MS = 500;
@@ -114,6 +129,8 @@ export interface BrowserTurn {
   prepare: () => Promise<CompiledChatGptWebPrompt & { release: () => void }>;
   abortSignal?: AbortSignal;
   onHeartbeat?: () => void;
+  /** Renew turn-scoped capabilities when the browser proves it is active. */
+  onActivity?: () => void;
   /** Visible ChatGPT reasoning-summary step titles only; never hidden chain-of-thought. */
   onReasoningSummary?: (text: string) => void;
   /** Stable visible ChatGPT prose between status/tool rows. */
@@ -152,10 +169,27 @@ export function chatGptTurnIsComplete(state: {
 
 export class ChatGptCompletionTracker {
   private candidate?: { signature: string; since: number };
+  private lastObservedAt?: number;
 
-  constructor(private readonly stableMs = 750) {}
+  constructor(
+    private readonly stableMs = 750,
+    private readonly maxObservationGapMs = CHATGPT_COMPLETION_OBSERVATION_GAP_MS,
+  ) {}
+
+  reset(): void {
+    this.candidate = undefined;
+    this.lastObservedAt = undefined;
+  }
 
   update(state: Parameters<typeof chatGptTurnIsComplete>[0], now = Date.now()): boolean {
+    // Stability means continuously observed stability. A pending tool, an
+    // event-loop stall, or Windows sleep must not age one stale pre-pause DOM
+    // sample into an instantly accepted final answer.
+    if (this.lastObservedAt !== undefined
+      && (now < this.lastObservedAt || now - this.lastObservedAt >= this.maxObservationGapMs)) {
+      this.candidate = undefined;
+    }
+    this.lastObservedAt = now;
     if (!chatGptTurnIsComplete(state)) {
       this.candidate = undefined;
       return false;
@@ -172,7 +206,10 @@ export class ChatGptCompletionTracker {
 export class ChatGptTurnDomHealthTracker {
   private sawResponse = false;
   private missingResponseSince?: number;
+  private runningWithoutResponseSince?: number;
   private emptyCompletionSince?: number;
+  private probeFailureSince?: number;
+  private lastObservedAt?: number;
 
   constructor(
     private readonly missingResponseMs = CHATGPT_RESPONSE_DOM_GRACE_MS,
@@ -185,6 +222,9 @@ export class ChatGptTurnDomHealthTracker {
      * appeared, losing it still uses the normal missingResponseMs watchdog.
      */
     private readonly allowInitialMissingResponse = false,
+    private readonly probeFailureMs = CHATGPT_DOM_PROBE_GRACE_MS,
+    private readonly maxObservationGapMs = CHATGPT_WATCHDOG_OBSERVATION_GAP_MS,
+    private readonly runningWithoutResponseMs = CHATGPT_RUNNING_WITHOUT_RESPONSE_GRACE_MS,
   ) {}
 
   update(state: {
@@ -192,11 +232,50 @@ export class ChatGptTurnDomHealthTracker {
     running: boolean;
     currentText: string;
     completionActionPresent: boolean;
+    probeSucceeded?: boolean;
   }, now = Date.now()): string | undefined {
+    // A watchdog deadline is valid only while failed observations are
+    // continuous. Pending tools, renderer stalls, and sleep/resume all create
+    // legitimate gaps between browser samples.
+    if (this.lastObservedAt !== undefined
+      && (now < this.lastObservedAt || now - this.lastObservedAt >= this.maxObservationGapMs)) {
+      this.missingResponseSince = undefined;
+      this.runningWithoutResponseSince = undefined;
+      this.emptyCompletionSince = undefined;
+      this.probeFailureSince = undefined;
+    }
+    this.lastObservedAt = now;
+
+    if (state.probeSucceeded === false) {
+      this.probeFailureSince ??= now;
+      if (now - this.probeFailureSince >= this.probeFailureMs) {
+        return "ChatGPT browser response could not be inspected continuously";
+      }
+      return undefined;
+    }
+    this.probeFailureSince = undefined;
+
     if (state.responsePresent) {
       this.sawResponse = true;
       this.missingResponseSince = undefined;
+      this.runningWithoutResponseSince = undefined;
+    } else if (state.running) {
+      // A visible Stop/Answer-now/current streaming control is stronger
+      // liveness evidence than the transient absence of one assistant root,
+      // but an unchanged stale control must not suppress every watchdog
+      // forever. Tool turns may legitimately run before creating their first
+      // assistant root; their outer inactivity budget remains the bound.
+      this.missingResponseSince = undefined;
+      if (this.allowInitialMissingResponse && !this.sawResponse) {
+        this.runningWithoutResponseSince = undefined;
+      } else {
+        this.runningWithoutResponseSince ??= now;
+        if (now - this.runningWithoutResponseSince >= this.runningWithoutResponseMs) {
+          return "ChatGPT remained active without a response DOM beyond the recovery window";
+        }
+      }
     } else if (!this.allowInitialMissingResponse || this.sawResponse) {
+      this.runningWithoutResponseSince = undefined;
       this.missingResponseSince ??= now;
       if (now - this.missingResponseSince >= this.missingResponseMs) {
         return this.sawResponse
@@ -209,6 +288,7 @@ export class ChatGptTurnDomHealthTracker {
       // conversation-turn node exists. Do not turn that valid pre-response
       // phase into a false DOM-health failure.
       this.missingResponseSince = undefined;
+      this.runningWithoutResponseSince = undefined;
     }
 
     const emptyCompletion = state.responsePresent
@@ -239,6 +319,7 @@ export interface ChatGptVisibleTraceEvent {
 }
 
 interface ChatGptResponseDomSnapshot {
+  probeSucceeded: boolean;
   responsePresent: boolean;
   running: boolean;
   deliveryTimeoutPresent: boolean;
@@ -250,7 +331,8 @@ interface ChatGptResponseDomSnapshot {
   traceBlocks: ChatGptVisibleTraceBlock[];
 }
 
-const absentResponseDomSnapshot = (): ChatGptResponseDomSnapshot => ({
+const absentResponseDomSnapshot = (probeSucceeded = true): ChatGptResponseDomSnapshot => ({
+  probeSucceeded,
   responsePresent: false,
   running: false,
   deliveryTimeoutPresent: false,
@@ -352,6 +434,21 @@ export function chatGptResponsePollInterval(
   responsePollMs = CHATGPT_RESPONSE_POLL_MS,
 ): number {
   return pendingToolCount > 0 ? CHATGPT_TOOL_WAIT_POLL_MS : responsePollMs;
+}
+
+/**
+ * Give a suspended or heavily starved process back a bounded amount of its
+ * inactivity budget. A renderer that returns one failed probe every 30 seconds
+ * must still reach a terminal watchdog instead of renewing itself forever.
+ */
+export function chatGptSchedulerGapExtension(gapMs: number, remainingMs: number): number {
+  if (!Number.isFinite(gapMs)
+    || gapMs < CHATGPT_WATCHDOG_OBSERVATION_GAP_MS
+    || !Number.isFinite(remainingMs)
+    || remainingMs <= 0) {
+    return 0;
+  }
+  return Math.min(gapMs, remainingMs);
 }
 
 export function chatGptRendererTelemetryEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
@@ -1076,13 +1173,18 @@ export class ChatGptBrowserWorker {
     let observed = "";
     while (Date.now() < deadline) {
       observed = await this.attachedPromptText(page);
-      if (observed === prompt) return;
+      if (browserComposerTextMatches(prompt, observed)) return;
       await new Promise(resolveSleep => setTimeout(resolveSleep, activePollingProfile.uiMs));
     }
+    const normalizedPrompt = normalizeBrowserComposerText(prompt);
+    const normalizedObserved = normalizeBrowserComposerText(observed);
     let commonPrefix = 0;
-    while (commonPrefix < prompt.length && prompt[commonPrefix] === observed[commonPrefix]) commonPrefix += 1;
+    while (commonPrefix < normalizedPrompt.length
+      && normalizedPrompt[commonPrefix] === normalizedObserved[commonPrefix]) commonPrefix += 1;
     throw new Error(
-      `ChatGPT composer did not preserve the complete prompt (expectedChars=${prompt.length}, actualChars=${observed.length}, commonPrefixChars=${commonPrefix})`,
+      `ChatGPT composer did not preserve the complete prompt (expectedChars=${prompt.length}, actualChars=${observed.length}, `
+      + `normalizedExpectedChars=${normalizedPrompt.length}, normalizedActualChars=${normalizedObserved.length}, `
+      + `commonPrefixChars=${commonPrefix})`,
     );
   }
 
@@ -1854,7 +1956,7 @@ export class ChatGptBrowserWorker {
   private stopControl(page: Page): Locator {
     return page.getByRole("button", { name: /^Stop (?:answering|generating)$/i }).or(
       page.getByTestId("stop-button"),
-    ).last();
+    ).or(page.getByRole("button", { name: "Answer now", exact: true })).last();
   }
 
   private async submissionState(
@@ -1947,7 +2049,8 @@ export class ChatGptBrowserWorker {
 
     const observedPrompt = await this.attachedPromptText(page).catch(() => undefined);
     const connectorStillSelected = !localTools || await this.connectorIsSelected(page, composer);
-    const safeToRetry = observedPrompt === prompt
+    const safeToRetry = observedPrompt !== undefined
+      && browserComposerTextMatches(prompt, observedPrompt)
       && connectorStillSelected
       && await send.isVisible().catch(() => false)
       && await send.isEnabled().catch(() => false);
@@ -2077,12 +2180,19 @@ export class ChatGptBrowserWorker {
           && rect.width > 0
           && rect.height > 0;
       };
-      const stop = document.querySelector<HTMLElement>([
+      const stopControls = document.querySelectorAll<HTMLElement>([
         'button[data-testid="stop-button"]',
         'button[aria-label="Stop answering"]',
         'button[aria-label="Stop generating"]',
       ].join(", "));
-      const running = Boolean(stop && visible(stop));
+      // Responsive layouts can leave a hidden stale Stop button before the
+      // visible current one. Inspect every match, and recognize ChatGPT's
+      // long-reasoning "Answer now" control as equivalent liveness evidence.
+      let running = [...stopControls].some(visible)
+        || [...document.querySelectorAll<HTMLElement>("button")].some(candidate => (
+          visible(candidate)
+          && (candidate.textContent ?? "").replace(/\s+/g, " ").trim() === "Answer now"
+        ));
       let deliveryTimeoutPresent = false;
       let toolConfirmationPresent = false;
       // Recovery states are rare and page-wide control scans are costly on long
@@ -2119,6 +2229,13 @@ export class ChatGptBrowserWorker {
           completionActionPresent: false,
           traceBlocks: [],
         };
+      }
+
+      if (!running) {
+        running = [...root.querySelectorAll<HTMLElement>([
+          '[aria-busy="true"]',
+          "[data-streaming-response-status]",
+        ].join(", "))].some(visible);
       }
 
       let rendered: HTMLElement | undefined;
@@ -2217,20 +2334,21 @@ export class ChatGptBrowserWorker {
       responseIndex,
       scanRecoverySignals,
       scanTraceBlocks,
-    }).catch(() => absentResponseDomSnapshot());
+    }).then(value => ({ ...value, probeSucceeded: true } satisfies ChatGptResponseDomSnapshot))
+      .catch(() => absentResponseDomSnapshot(false));
     snapshot.traceBlocks = snapshot.traceBlocks.filter(block => !isChatGptTraceControl(block));
     return snapshot;
   }
 
-  private async finalResponseHtml(page: Page, responseIndex: number): Promise<string> {
+  private async finalResponseHtml(page: Page, responseIndex: number): Promise<string | undefined> {
     return page.evaluate(responseIndex => {
       const root = document.querySelectorAll<HTMLElement>(
         'section[data-testid^="conversation-turn-"][data-turn="assistant"]',
       )[responseIndex];
-      if (!root) return "";
+      if (!root) return undefined;
       const markdown = root.querySelectorAll<HTMLElement>(".markdown");
       return markdown.length > 0 ? markdown[markdown.length - 1]!.innerHTML : "";
-    }, responseIndex).catch(() => "");
+    }, responseIndex).catch(() => undefined);
   }
 
   private async stalledTurnDiagnostic(page: Page, responseTurn: Locator): Promise<string> {
@@ -2285,7 +2403,14 @@ export class ChatGptBrowserWorker {
     try {
       if (turn.abortSignal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
       const estimatedInputTokens = estimateCompiledChatGptWebInputTokens(prepared, turn.modelId);
-      let deadline = Date.now() + this.config.turnTimeoutMs;
+      let inactivityBudgetMs = this.config.turnTimeoutMs;
+      let deadline = Date.now() + inactivityBudgetMs;
+      let schedulerGapExtensionRemainingMs = CHATGPT_MAX_SCHEDULER_GAP_EXTENSION_MS;
+      const recordActivity = () => {
+        deadline = Date.now() + inactivityBudgetMs;
+        schedulerGapExtensionRemainingMs = CHATGPT_MAX_SCHEDULER_GAP_EXTENSION_MS;
+        try { turn.onActivity?.(); } catch { /* capability renewal must not break browser progress */ }
+      };
       const page = await this.runStage(turn.traceId, "browser_page", browserStageTimeouts.browserPage, () => this.pageForNewTurn());
       console.info(
         `[chatgpt-web] browser turn ${turn.traceId} opened (transport=inline, promptChars=${prepared.text.length}, estimatedInputTokens=${estimatedInputTokens}, images=${prepared.images.length})`,
@@ -2316,13 +2441,14 @@ export class ChatGptBrowserWorker {
         if (chatGptRendererTelemetryEnabled()) {
           rendererTelemetry = new ChatGptRendererTelemetry(page, turn.traceId);
         }
-        deadline = Date.now() + Math.max(
+        inactivityBudgetMs = Math.max(
           this.config.turnTimeoutMs,
           DEFAULT_CHATGPT_TOOL_TURN_TIMEOUT_MS,
         );
+        recordActivity();
         console.info(
-          "[chatgpt-web] tool-capable browser turn lifetime="
-          + String(Math.round((deadline - Date.now()) / 60_000))
+          "[chatgpt-web] tool-capable browser turn inactivity budget="
+          + String(Math.round(inactivityBudgetMs / 60_000))
           + "m",
         );
       }
@@ -2344,6 +2470,9 @@ export class ChatGptBrowserWorker {
         initialUserTurnCount,
         initialResponseTurnCount,
       ));
+      // Setup stages have their own bounded deadlines. Start the turn's
+      // inactivity budget from the successful send, not from browser startup.
+      recordActivity();
 
       let lastHeartbeat = 0;
       let finalText = "";
@@ -2356,6 +2485,9 @@ export class ChatGptBrowserWorker {
       let markdownStream = new ChatGptMarkdownStream(stripChatGptTransportMarkers);
       let completionTracker = new ChatGptCompletionTracker();
       let previousPendingToolCount = 0;
+      let previousRunning = false;
+      let completionBlockedUntil = 0;
+      let lastLoopAt = Date.now();
       let nextRecoverySignalScanAt = 0;
       let nextTraceScanAt = 0;
       let domHealthTracker = new ChatGptTurnDomHealthTracker(
@@ -2371,6 +2503,25 @@ export class ChatGptBrowserWorker {
         await new Promise(resolveSleep => setTimeout(resolveSleep, timeoutMs));
       };
       for (;;) {
+        const loopNow = Date.now();
+        const loopGapMs = loopNow - lastLoopAt;
+        if (loopNow < lastLoopAt) {
+          completionTracker.reset();
+        } else {
+          const gapExtensionMs = chatGptSchedulerGapExtension(
+            loopGapMs,
+            schedulerGapExtensionRemainingMs,
+          );
+          if (gapExtensionMs > 0) {
+            // Preserve up to one hour across Windows sleep/CPU starvation, but
+            // consume a finite allowance so recurrent slow renderer failures
+            // cannot evade the outer inactivity deadline indefinitely.
+            deadline += gapExtensionMs;
+            schedulerGapExtensionRemainingMs -= gapExtensionMs;
+            completionTracker.reset();
+          }
+        }
+        lastLoopAt = loopNow;
         if (turn.abortSignal?.aborted) {
           const stop = page.getByRole("button", { name: "Stop answering" });
           if (await stop.isVisible().catch(() => false)) await stop.click().catch(() => {});
@@ -2378,17 +2529,23 @@ export class ChatGptBrowserWorker {
         }
 
         if (Date.now() >= deadline) {
-          throw new Error("ChatGPT web tool turn exceeded its absolute browser lifetime");
+          throw new Error("ChatGPT web turn made no observable progress before its inactivity deadline");
         }
         if (Date.now() - lastHeartbeat >= 10_000) {
           turn.onHeartbeat?.();
           lastHeartbeat = Date.now();
         }
+        // Renew the broker before any operation that may prune expired
+        // channels. This also makes a safe sleep/resume revive the still-owned
+        // capability before the next local tool request.
+        try { turn.onActivity?.(); } catch { /* renewal is best-effort here */ }
 
         const pendingToolCount = mode.localTools
           ? Math.max(0, turn.pendingToolCount?.() ?? 0)
           : 0;
         if (pendingToolCount > 0) {
+          completionTracker.reset();
+          if (pendingToolCount !== previousPendingToolCount) recordActivity();
           await rendererTelemetry?.sample(
             previousPendingToolCount > 0 ? "tool-wait" : "tool-wait-start",
             pendingToolCount,
@@ -2408,6 +2565,9 @@ export class ChatGptBrowserWorker {
         if (previousPendingToolCount > 0) {
           await rendererTelemetry?.sample("tool-wait-end", 0, true);
           previousPendingToolCount = 0;
+          completionTracker.reset();
+          completionBlockedUntil = Date.now() + CHATGPT_POST_TOOL_COMPLETION_GRACE_MS;
+          recordActivity();
         }
 
         const now = Date.now();
@@ -2427,6 +2587,7 @@ export class ChatGptBrowserWorker {
           deliveryTimeoutRecoveries += 1;
           finalText = "";
           sawRunning = false;
+          previousRunning = false;
           loggedCompletionWait = false;
           loggedInitialToolDomWait = false;
           sentAt = Date.now();
@@ -2438,18 +2599,31 @@ export class ChatGptBrowserWorker {
             CHATGPT_EMPTY_RESPONSE_GRACE_MS,
             true,
           );
+          recordActivity();
           await waitForActivity(0, activePollingProfile.responseMs);
           continue;
         }
         if (mode.localTools && snapshot.toolConfirmationPresent && await this.handleToolConfirmation(page)) {
+          completionTracker.reset();
+          recordActivity();
           await waitForActivity(0, activePollingProfile.responseMs);
           continue;
         }
 
         const running = snapshot.running;
-        if (running) sawRunning = true;
+        if (running) {
+          sawRunning = true;
+        }
+        // A transition into or out of the browser's active-generation state is
+        // observable progress. Merely polling the same stale control is not.
+        if (snapshot.probeSucceeded && running !== previousRunning) {
+          recordActivity();
+          previousRunning = running;
+        }
         if (snapshot.responsePresent) {
-          for (const trace of visibleTrace.observe(snapshot.traceBlocks, snapshot.completionActionPresent)) {
+          const newTrace = visibleTrace.observe(snapshot.traceBlocks, snapshot.completionActionPresent);
+          if (newTrace.length > 0) recordActivity();
+          for (const trace of newTrace) {
             if (trace.kind === "commentary") turn.onCommentary?.(trace.text, trace.continuation === true);
             else turn.onReasoningSummary?.(trace.text);
           }
@@ -2458,18 +2632,52 @@ export class ChatGptBrowserWorker {
             running,
             currentText: snapshot.visibleTextLength > 0 ? "present" : "",
             completionActionPresent: snapshot.completionActionPresent,
+            probeSucceeded: snapshot.probeSucceeded,
           });
           if (domError) throw new Error(domError);
-          if (completionTracker.update({
+          const completionState = {
             responsePresent: snapshot.responsePresent,
             running,
             currentText: snapshot.completionSignature,
             completionActionPresent: snapshot.completionActionPresent,
-          })) {
+          };
+          let completionReady = false;
+          if (Date.now() >= completionBlockedUntil) {
+            completionReady = completionTracker.update(completionState);
+          } else {
+            completionTracker.reset();
+          }
+          if (completionReady) {
+            // A tool can queue while the awaited DOM snapshot is running. Never
+            // turn the stale pre-tool action row into end_turn=true.
+            const pendingBeforeFinalize = mode.localTools
+              ? Math.max(0, turn.pendingToolCount?.() ?? 0)
+              : 0;
+            if (pendingBeforeFinalize > 0) {
+              completionTracker.reset();
+              previousPendingToolCount = pendingBeforeFinalize;
+              continue;
+            }
             if (snapshot.visibleText === "api_tool unavailable") {
               throw new Error("ChatGPT selected mode rejected the Codex Native MCP tool (api_tool unavailable)");
             }
             const finalHtml = await this.finalResponseHtml(page, initialResponseTurnCount);
+            const pendingAfterFinalize = mode.localTools
+              ? Math.max(0, turn.pendingToolCount?.() ?? 0)
+              : 0;
+            if (pendingAfterFinalize > 0) {
+              completionTracker.reset();
+              previousPendingToolCount = pendingAfterFinalize;
+              continue;
+            }
+            // The response root may remount between the lightweight snapshot
+            // and final serialization. Retry instead of turning that race into
+            // a fatal empty-answer error.
+            if (finalHtml === undefined) {
+              completionTracker.reset();
+              await waitForActivity(0, activePollingProfile.responseMs);
+              continue;
+            }
             const final = markdownStream.finish(finalHtml);
             if (!final.markdown && snapshot.visibleTextLength > 0) {
               throw new Error("ChatGPT completed with visible text that could not be serialized as Markdown");
@@ -2493,6 +2701,7 @@ export class ChatGptBrowserWorker {
             running,
             currentText: "",
             completionActionPresent: false,
+            probeSucceeded: snapshot.probeSucceeded,
           });
           if (domError) throw new Error(domError);
 

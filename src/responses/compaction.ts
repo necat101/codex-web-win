@@ -35,7 +35,37 @@ export const OPAQUE_COMPACTION_NOTE = "[earlier conversation was compacted; the 
 
 /** Exact framing emitted by this proxy for a readable replayed Codex compaction summary. */
 export function isReadableCompactionSummaryText(value: unknown): value is string {
-  return typeof value === "string" && value.startsWith(`${SUMMARY_PREFIX}\n\n`);
+  // Remote-v2 replay uses a blank line; codex-rs local compaction uses one newline. Both install
+  // replacement history and therefore define a new provider-private execution epoch.
+  return typeof value === "string" && value.startsWith(`${SUMMARY_PREFIX}\n`);
+}
+
+function localCompactionMessageText(value: unknown): string | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const item = value as { type?: unknown; role?: unknown; id?: unknown; content?: unknown };
+  if (item.type !== undefined && item.type !== "message") return null;
+  if (item.role !== "user") return null;
+  // Normal client-authored messages have a native item id. The internal local-compaction prompt
+  // is intentionally anonymous; requiring that wire distinction avoids interpreting replayed user
+  // prose as a control request.
+  if (Object.prototype.hasOwnProperty.call(item, "id")) return null;
+  if (typeof item.content === "string") return item.content;
+  if (!Array.isArray(item.content) || item.content.length === 0) return null;
+  let text = "";
+  for (const rawBlock of item.content) {
+    if (!rawBlock || typeof rawBlock !== "object" || Array.isArray(rawBlock)) return null;
+    const block = rawBlock as { type?: unknown; text?: unknown };
+    if ((block.type !== "input_text" && block.type !== "text") || typeof block.text !== "string") return null;
+    text += block.text;
+  }
+  return text;
+}
+
+/** Detect codex-rs's legacy/local auto-compaction request carried over normal `/responses`. */
+export function isLocalCompactionPromptItem(value: unknown): boolean {
+  const text = localCompactionMessageText(value);
+  if (text === null) return false;
+  return text.replace(/\r\n?/g, "\n").trim() === COMPACT_PROMPT.replace(/\r\n?/g, "\n").trim();
 }
 
 export function encodeCompactionSummary(summary: string): string {

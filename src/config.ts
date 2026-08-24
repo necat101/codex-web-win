@@ -25,6 +25,15 @@ export interface TunnelConfig {
   alias: string;
 }
 
+export interface DeepSeekWebConfig {
+  /** DeepSeek Web models are opt-in and remain hidden unless explicitly enabled. */
+  enabled: boolean;
+  /** Independent Playwright storage state for the user's DeepSeek web session. */
+  storageStatePath: string;
+  /** Records the explicit cross-provider data-sharing acknowledgement. */
+  acknowledgedAt?: string;
+}
+
 export interface AppConfig {
   version: 2;
   releaseVersion: string;
@@ -42,6 +51,7 @@ export interface AppConfig {
   controlToken: string;
   runtimeCommand: string[];
   acknowledgedUnofficialAt?: string;
+  deepSeekWeb?: DeepSeekWebConfig;
   tunnel?: TunnelConfig;
 }
 
@@ -54,6 +64,13 @@ export function expandUserPath(value: string): string {
 export function getConfigDir(): string {
   const configured = process.env.CODEX_CHATGPT_WEB_HOME?.trim();
   return resolve(expandUserPath(configured || join(homedir(), ".codex-chatgpt-web")));
+}
+
+export function defaultDeepSeekWebConfig(home = getConfigDir()): DeepSeekWebConfig {
+  return {
+    enabled: false,
+    storageStatePath: join(home, "browser", "deepseek-storage-state.json"),
+  };
 }
 
 export function getConfigPath(): string {
@@ -127,6 +144,7 @@ export function defaultConfig(mode: RuntimeMode = "browser-only"): AppConfig {
     autoApproveToolCalls: false,
     controlToken: randomBytes(32).toString("base64url"),
     runtimeCommand: currentRuntimeCommand(),
+    deepSeekWeb: defaultDeepSeekWebConfig(home),
   };
 }
 
@@ -295,10 +313,51 @@ function parseConfig(
   if (parsed.proAvailable !== undefined && typeof parsed.proAvailable !== "boolean") {
     throw new Error(`Invalid proAvailable in ${path}`);
   }
+  const storageStatePath = resolve(expandUserPath(parsed.storageStatePath as string));
+  let deepSeekWeb: DeepSeekWebConfig;
+  if (parsed.deepSeekWeb === undefined) {
+    // Version-2 configurations created before DeepSeek support remain valid and
+    // safely default to an opt-in-disabled provider with independent state.
+    deepSeekWeb = defaultDeepSeekWebConfig();
+  } else {
+    if (!parsed.deepSeekWeb || typeof parsed.deepSeekWeb !== "object" || Array.isArray(parsed.deepSeekWeb)) {
+      throw new Error(`Invalid deepSeekWeb in ${path}`);
+    }
+    const candidate = parsed.deepSeekWeb as Partial<DeepSeekWebConfig>;
+    if (typeof candidate.enabled !== "boolean") throw new Error(`Invalid deepSeekWeb.enabled in ${path}`);
+    if (typeof candidate.storageStatePath !== "string" || !candidate.storageStatePath.trim()) {
+      throw new Error(`Missing deepSeekWeb.storageStatePath in ${path}`);
+    }
+    if (candidate.acknowledgedAt !== undefined
+      && (typeof candidate.acknowledgedAt !== "string" || !candidate.acknowledgedAt.trim())) {
+      throw new Error(`Invalid deepSeekWeb.acknowledgedAt in ${path}`);
+    }
+    if (candidate.enabled && !candidate.acknowledgedAt) {
+      throw new Error(`DeepSeek Web is enabled without an explicit acknowledgement in ${path}`);
+    }
+    deepSeekWeb = {
+      enabled: candidate.enabled,
+      storageStatePath: resolve(expandUserPath(candidate.storageStatePath)),
+      ...(candidate.acknowledgedAt ? { acknowledgedAt: candidate.acknowledgedAt } : {}),
+    };
+  }
+  const chatGptStorageIdentity = process.platform === "win32"
+    ? storageStatePath.toLowerCase()
+    : storageStatePath;
+  const deepSeekStorageIdentity = process.platform === "win32"
+    ? deepSeekWeb.storageStatePath.toLowerCase()
+    : deepSeekWeb.storageStatePath;
+  if (chatGptStorageIdentity === deepSeekStorageIdentity) {
+    throw new Error(
+      `ChatGPT and DeepSeek Web must use separate browser storage-state paths in ${path}`,
+    );
+  }
   return {
     ...parsed,
+    storageStatePath,
     brokerSocketPath: resolveBrokerSocketPath(parsed.brokerSocketPath),
     proAvailable: parsed.proAvailable === true,
+    deepSeekWeb,
   } as AppConfig;
 }
 
@@ -330,6 +389,12 @@ export function providerConfig(config: AppConfig): CodexProviderConfig {
       localToolsEnabled: config.mode === "full",
       proAvailable: config.proAvailable,
       autoApproveToolCalls: config.autoApproveToolCalls,
+    },
+    deepseekWeb: {
+      enabled: config.deepSeekWeb?.enabled === true,
+      storageStatePath: config.deepSeekWeb?.storageStatePath,
+      chromeExecutablePath: config.chromeExecutablePath,
+      headed: config.headed,
     },
   };
 }

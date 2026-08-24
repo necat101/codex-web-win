@@ -4,6 +4,7 @@ import { Writable } from "node:stream";
 import { existsSync, rmSync } from "node:fs";
 import { stdin, stdout } from "node:process";
 import { checkBrowserEngine, loginToChatGpt } from "./browser-login";
+import { loginToDeepSeek } from "./deepseek-browser-login";
 import { getConfigDir, getConfigPath, loadConfig, loadConfigForSetup, saveConfig } from "./config";
 import { installCodexIntegration, uninstallCodexIntegration } from "./codex-integration";
 import { formatDoctorReport, runDoctor } from "./doctor";
@@ -38,6 +39,7 @@ Usage:
   codex-chatgpt-web setup --browser-only [options]
   codex-chatgpt-web setup --full --tunnel-id ID --runtime-key-file PATH [options]
   codex-chatgpt-web login
+  codex-chatgpt-web deepseek-login
   codex-chatgpt-web doctor [--json]
   codex-chatgpt-web browser check
   codex-chatgpt-web gui <status|setup|stop-session>
@@ -60,6 +62,10 @@ Setup options:
   --replace-codex-route        Reversibly replace existing Codex model routing
   --restart-service            Explicitly restart this project's daemon after an update
   --login                      Refresh the stored ChatGPT login even if one exists
+  --deepseek-web               Opt in to DeepSeek Web Instant and Expert models
+  --no-deepseek-web            Disable DeepSeek Web models without deleting their login state
+  --deepseek-login             Refresh the independent DeepSeek login during setup
+  --acknowledge-deepseek       Accept experimental DeepSeek automation and its data boundary
   --auto-approve-tool-calls    Opt in to per-call browser clicks on "Allow once" prompts
   --acknowledge-unofficial     Accept the one-time unofficial-browser-automation notice
 
@@ -133,11 +139,19 @@ async function setupCommand(args: string[]): Promise<void> {
   const tunnelId = takeOption(args, "--tunnel-id");
   const runtimeKeyFile = takeOption(args, "--runtime-key-file");
   const chrome = takeOption(args, "--chrome");
+  const enableDeepSeek = takeFlag(args, "--deepseek-web");
+  const disableDeepSeek = takeFlag(args, "--no-deepseek-web");
+  if (enableDeepSeek && disableDeepSeek) {
+    throw new Error("Choose at most one of --deepseek-web or --no-deepseek-web");
+  }
   if (chrome) options.chromeExecutablePath = chrome;
   if (appName) options.appName = appName;
   if (tunnelId) options.tunnelId = tunnelId;
   if (runtimeKeyFile) options.runtimeKeyFile = runtimeKeyFile;
   options.forceLogin = takeFlag(args, "--login");
+  options.deepSeekEnabled = enableDeepSeek ? true : disableDeepSeek ? false : undefined;
+  options.forceDeepSeekLogin = takeFlag(args, "--deepseek-login");
+  options.acknowledgedDeepSeek = takeFlag(args, "--acknowledge-deepseek");
   options.autoApproveToolCalls = takeFlag(args, "--auto-approve-tool-calls");
   options.replaceCodexRoute = takeFlag(args, "--replace-codex-route");
   options.restartService = takeFlag(args, "--restart-service");
@@ -154,6 +168,16 @@ async function setupCommand(args: string[]): Promise<void> {
   options.acknowledgedUnofficial = true;
 
   const existing = existsSync(getConfigPath()) ? loadConfigForSetup() : undefined;
+  if (options.deepSeekEnabled === true
+    && !options.acknowledgedDeepSeek
+    && !existing?.deepSeekWeb?.acknowledgedAt) {
+    stdout.write(
+      "DeepSeek Web is an independent, experimental browser-automation provider. Its automation may conflict "
+      + "with DeepSeek's terms. Only when you explicitly select a DeepSeek Web model, the Codex task context "
+      + "for that request is sent to DeepSeek under its own terms and account settings.\n",
+    );
+    options.acknowledgedDeepSeek = await confirm("Enable DeepSeek Web and store this acknowledgement?");
+  }
   const reusableCredentials = existingFullSetupCredentials(existing);
   const needsTunnelId = !options.tunnelId && !reusableCredentials.tunnelId;
   const needsRuntimeKey = !options.runtimeKeyFile
@@ -411,6 +435,14 @@ async function main(): Promise<void> {
     config.proAvailable = result.proAvailable;
     saveConfig(config);
     stdout.write(`ChatGPT login stored at ${result.storageStatePath}\n`);
+  } else if (command === "deepseek-login") {
+    assertNoArgs(args);
+    const config = loadConfig();
+    if (config.deepSeekWeb?.enabled !== true) {
+      throw new Error("DeepSeek Web is disabled; enable it through setup before refreshing its login");
+    }
+    await loginToDeepSeek(config);
+    stdout.write(`DeepSeek login stored at ${config.deepSeekWeb.storageStatePath}\n`);
   } else if (command === "doctor" || command === "status") await doctorCommand(args);
   else if (command === "browser") {
     const action = args.shift();

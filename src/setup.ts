@@ -2,13 +2,24 @@ import { existsSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { createServer } from "node:net";
 import type { AppConfig, RuntimeMode } from "./config";
-import { currentRuntimeCommand, defaultConfig, getConfigPath, loadConfigForSetup, saveConfig } from "./config";
+import {
+  currentRuntimeCommand,
+  defaultConfig,
+  defaultDeepSeekWebConfig,
+  getConfigPath,
+  loadConfigForSetup,
+  saveConfig,
+} from "./config";
 import {
   browserLoginStateExists,
   inspectBrowserLoginCapabilities,
   loginToChatGpt,
   storedBrowserLoginCapabilities,
 } from "./browser-login";
+import {
+  deepSeekBrowserLoginStateExists,
+  loginToDeepSeek,
+} from "./deepseek-browser-login";
 import { installCodexIntegration } from "./codex-integration";
 import { assertServiceIdle, getServiceStatus, installService, removeLegacyRuntimeArtifacts, restartService } from "./service";
 import { connectTunnel, createTunnelConfig, installRuntimeKey, installRuntimeKeyBytes, installTunnelClient, managedRuntimeKeyPath, stopTunnel, waitForTunnelReady } from "./tunnel";
@@ -21,6 +32,9 @@ export interface SetupOptions {
   chromeExecutablePath?: string;
   appName?: string;
   forceLogin?: boolean;
+  deepSeekEnabled?: boolean;
+  forceDeepSeekLogin?: boolean;
+  acknowledgedDeepSeek?: boolean;
   autoApproveToolCalls?: boolean;
   replaceCodexRoute?: boolean;
   restartService?: boolean;
@@ -35,6 +49,7 @@ export interface SetupResult {
   mode: RuntimeMode;
   configPath: string;
   loginCreated: boolean;
+  deepSeekLoginCreated: boolean;
   serviceLoaded: boolean;
   tunnelReady: boolean | null;
   codexRestartRequired: true;
@@ -59,7 +74,7 @@ function loadExistingConfig(): AppConfig | undefined {
   return loadConfigForSetup();
 }
 
-function meaningfulRuntimeChange(before: AppConfig, after: AppConfig): boolean {
+export function meaningfulRuntimeChange(before: AppConfig, after: AppConfig): boolean {
   return JSON.stringify({
     mode: before.mode,
     releaseVersion: before.releaseVersion,
@@ -75,6 +90,10 @@ function meaningfulRuntimeChange(before: AppConfig, after: AppConfig): boolean {
     autoApproveToolCalls: before.autoApproveToolCalls,
     controlToken: before.controlToken,
     runtimeCommand: before.runtimeCommand,
+    deepSeekWeb: before.deepSeekWeb ? {
+      enabled: before.deepSeekWeb.enabled,
+      storageStatePath: before.deepSeekWeb.storageStatePath,
+    } : undefined,
     tunnel: before.tunnel,
   }) !== JSON.stringify({
     mode: after.mode,
@@ -91,8 +110,26 @@ function meaningfulRuntimeChange(before: AppConfig, after: AppConfig): boolean {
     autoApproveToolCalls: after.autoApproveToolCalls,
     controlToken: after.controlToken,
     runtimeCommand: after.runtimeCommand,
+    deepSeekWeb: after.deepSeekWeb ? {
+      enabled: after.deepSeekWeb.enabled,
+      storageStatePath: after.deepSeekWeb.storageStatePath,
+    } : undefined,
     tunnel: after.tunnel,
   });
+}
+
+export function setupRequestsRuntimeChange(
+  existing: AppConfig | undefined,
+  after: AppConfig,
+  options: Pick<SetupOptions, "forceLogin" | "forceDeepSeekLogin">,
+  explicitTunnelChange = false,
+): boolean {
+  return Boolean(existing && (
+    meaningfulRuntimeChange(existing, after)
+    || explicitTunnelChange
+    || options.forceLogin
+    || options.forceDeepSeekLogin
+  ));
 }
 
 export function tunnelWorkerRuntimeChanged(before: AppConfig | undefined, after: AppConfig): boolean {
@@ -132,6 +169,28 @@ async function waitForProxy(config: AppConfig, timeoutMs = 10_000): Promise<void
   throw new Error(`Responses proxy did not become ready: ${lastError}`);
 }
 
+export function applyDeepSeekSetupOptions(
+  config: AppConfig,
+  options: Pick<SetupOptions, "deepSeekEnabled" | "forceDeepSeekLogin" | "acknowledgedDeepSeek">,
+  acknowledgedAt = new Date().toISOString(),
+): void {
+  const deepSeekWeb = structuredClone(config.deepSeekWeb ?? defaultDeepSeekWebConfig());
+  if (options.deepSeekEnabled !== undefined) deepSeekWeb.enabled = options.deepSeekEnabled;
+  if (options.acknowledgedDeepSeek) deepSeekWeb.acknowledgedAt = acknowledgedAt;
+  if (options.forceDeepSeekLogin && !deepSeekWeb.enabled) {
+    throw new Error("DeepSeek login refresh requires DeepSeek Web to be enabled");
+  }
+  if (deepSeekWeb.enabled && !deepSeekWeb.acknowledgedAt) {
+    throw new Error(
+      "Enabling DeepSeek Web requires explicit acknowledgement that its browser automation is experimental and selected Codex task context is sent to DeepSeek. "
+      + "Pass --acknowledge-deepseek.",
+    );
+  }
+  // Disabling the provider changes only visibility/routing. Its independently
+  // stored login state is deliberately retained for a later explicit re-enable.
+  config.deepSeekWeb = deepSeekWeb;
+}
+
 function baseConfig(existing: AppConfig | undefined, options: SetupOptions): AppConfig {
   const config = existing ? structuredClone(existing) : defaultConfig(options.mode);
   config.mode = options.mode;
@@ -148,6 +207,7 @@ function baseConfig(existing: AppConfig | undefined, options: SetupOptions): App
   if (!config.acknowledgedUnofficialAt) {
     throw new Error("Setup requires explicit acknowledgement that this is unofficial browser automation. Pass --acknowledge-unofficial.");
   }
+  applyDeepSeekSetupOptions(config, options);
   return config;
 }
 
@@ -193,16 +253,23 @@ export async function setup(options: SetupOptions): Promise<SetupResult> {
   }
 
   let loginCreated = false;
+  let deepSeekLoginCreated = false;
   let proAvailable = storedBrowserLoginCapabilities(config).proAvailable;
   const loginRequired = options.forceLogin || !browserLoginStateExists(config);
   const capabilityProbeRequired = !loginRequired && proAvailable === undefined;
-  if (beforeService.loaded && (loginRequired || capabilityProbeRequired) && !options.restartService) {
+  const deepSeekLoginRequired = config.deepSeekWeb?.enabled === true
+    && (options.forceDeepSeekLogin || !deepSeekBrowserLoginStateExists(config));
+  if (beforeService.loaded
+    && (loginRequired || capabilityProbeRequired || deepSeekLoginRequired)
+    && !options.restartService) {
     throw new Error(
       "Setup must verify the browser account before changing the running daemon. "
       + "Rerun from a normal terminal with --restart-service after the active task finishes.",
     );
   }
-  if (beforeService.loaded && (loginRequired || capabilityProbeRequired) && existing) await assertServiceIdle(existing);
+  if (beforeService.loaded
+    && (loginRequired || capabilityProbeRequired || deepSeekLoginRequired)
+    && existing) await assertServiceIdle(existing);
   if (loginRequired) {
     const login = await loginToChatGpt(config, { announce: !options.quiet });
     proAvailable = login.proAvailable;
@@ -211,8 +278,12 @@ export async function setup(options: SetupOptions): Promise<SetupResult> {
     proAvailable = (await inspectBrowserLoginCapabilities(config)).proAvailable;
   }
   config.proAvailable = proAvailable === true;
+  if (deepSeekLoginRequired) {
+    await loginToDeepSeek(config, { announce: !options.quiet });
+    deepSeekLoginCreated = true;
+  }
   const explicitTunnelChange = Boolean(options.tunnelId || options.runtimeKeyFile || options.runtimeKeyValue);
-  const preliminaryChange = Boolean(existing && (meaningfulRuntimeChange(existing, config) || explicitTunnelChange || options.forceLogin));
+  const preliminaryChange = setupRequestsRuntimeChange(existing, config, options, explicitTunnelChange);
   if (beforeService.loaded && preliminaryChange && !options.restartService) {
     throw new Error(
       "The daemon is currently serving a Codex task and setup would change its runtime. "
@@ -290,6 +361,7 @@ export async function setup(options: SetupOptions): Promise<SetupResult> {
     mode: config.mode,
     configPath: getConfigPath(),
     loginCreated,
+    deepSeekLoginCreated,
     serviceLoaded: managedServices && getServiceStatus().loaded,
     tunnelReady,
     codexRestartRequired: true,

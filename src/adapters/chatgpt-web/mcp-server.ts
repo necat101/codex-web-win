@@ -143,6 +143,47 @@ export interface GatewayNestedTool {
   freeform: boolean;
 }
 
+/**
+ * Retains a live gateway inventory only while the exact turn binding and its
+ * directly advertised tool fingerprint remain current. Runtime ALL_TOOLS
+ * discovery occasionally succeeds with an empty registry while the native
+ * bridge is recycling; treating that one sample as authoritative makes tools
+ * disappear for the remainder of the task.
+ *
+ * Activation is deliberately separate from preservation. A newer fingerprint
+ * can invalidate the binding synchronously before an older in-flight refresh
+ * completes, so that late refresh cannot repopulate the new scope.
+ */
+export class GatewayInventoryLastKnownGood {
+  private readonly byBinding = new Map<string, {
+    fingerprint: string;
+    tools?: GatewayNestedTool[];
+  }>();
+
+  activate(bindingId: string, fingerprint: string): void {
+    const current = this.byBinding.get(bindingId);
+    if (current?.fingerprint === fingerprint) return;
+    this.byBinding.set(bindingId, { fingerprint });
+  }
+
+  preserve(
+    bindingId: string,
+    fingerprint: string,
+    refreshed: GatewayNestedTool[],
+    fallback: GatewayNestedTool[] = [],
+  ): GatewayNestedTool[] {
+    const current = this.byBinding.get(bindingId);
+    if (current?.fingerprint !== fingerprint) {
+      return refreshed.length > 0 ? refreshed : fallback;
+    }
+    if (refreshed.length > 0) {
+      current.tools = refreshed;
+      return refreshed;
+    }
+    return current.tools ?? fallback;
+  }
+}
+
 // The outer Codex tool registry is stable for one bound turn. A one-second
 // cache caused repeated ALL_TOOLS probes whenever the web model paused between
 // inventory and invocation, wasting both latency and web-context tokens. Keep a
@@ -429,6 +470,7 @@ export async function runChatGptMcpServer(options: { brokerSocketPath: string })
     createdAt: number;
     tools: Promise<GatewayNestedTool[]>;
   }>();
+  const gatewayInventoryLastKnownGood = new GatewayInventoryLastKnownGood();
 
   const capabilityKey = (value: string) => createHash("sha256").update(value).digest("hex");
 
@@ -515,6 +557,7 @@ export async function runChatGptMcpServer(options: { brokerSocketPath: string })
       freeform: tool.freeform === true,
       toolSearch: tool.toolSearch === true,
     })))).digest("hex");
+    gatewayInventoryLastKnownGood.activate(bindingId, fingerprint);
     const cached = gatewayInventoryCache.get(bindingId);
     if (cached
       && cached.fingerprint === fingerprint
@@ -522,7 +565,9 @@ export async function runChatGptMcpServer(options: { brokerSocketPath: string })
     const pending = (async () => {
       const fallback = gatewayNestedTools(bound);
       const gateway = execGateway(bound);
-      if (!gateway) return fallback;
+      if (!gateway) {
+        return gatewayInventoryLastKnownGood.preserve(bindingId, fingerprint, fallback);
+      }
       try {
         const response = await invokeRaw(bindingId, bound, gateway, {
           input: "text(ALL_TOOLS.map(tool => ({ name: tool.name, description: tool.description })));",
@@ -532,9 +577,13 @@ export async function runChatGptMcpServer(options: { brokerSocketPath: string })
           && (item as Record<string, unknown>).type === "text"
           && typeof (item as Record<string, unknown>).text === "string"
         ));
-        if (!textBlock) return fallback;
+        if (!textBlock) {
+          return gatewayInventoryLastKnownGood.preserve(bindingId, fingerprint, [], fallback);
+        }
         const runtime = parseGatewayRuntimeTools(JSON.parse(textBlock.text));
-        if (runtime.length === 0) return fallback;
+        if (runtime.length === 0) {
+          return gatewayInventoryLastKnownGood.preserve(bindingId, fingerprint, [], fallback);
+        }
         const merged = new Map(fallback.map(tool => [tool.wireName, tool]));
         for (const tool of runtime) {
           const existing = merged.get(tool.wireName);
@@ -547,9 +596,9 @@ export async function runChatGptMcpServer(options: { brokerSocketPath: string })
               }
             : tool);
         }
-        return [...merged.values()];
+        return gatewayInventoryLastKnownGood.preserve(bindingId, fingerprint, [...merged.values()], fallback);
       } catch {
-        return fallback;
+        return gatewayInventoryLastKnownGood.preserve(bindingId, fingerprint, [], fallback);
       }
     })();
     gatewayInventoryCache.set(bindingId, { fingerprint, createdAt: Date.now(), tools: pending });

@@ -6,6 +6,13 @@ import {
   CHATGPT_WEB_MODEL_PREFIX,
   type ChatGptWebModelRoute,
 } from "./chatgpt-web-models";
+import {
+  availableDeepSeekWebModelRoutes,
+  DEEPSEEK_WEB_AUTO_COMPACT_TOKEN_LIMIT,
+  DEEPSEEK_WEB_CONTEXT_WINDOW,
+  DEEPSEEK_WEB_MODEL_PREFIX,
+  type DeepSeekWebModelRoute,
+} from "./deepseek-web-models";
 
 const NATIVE_TEMPLATE_MODEL = CHATGPT_WEB_BACKEND_MODEL;
 
@@ -67,6 +74,38 @@ export function buildChatGptWebModel(
   return model;
 }
 
+export function buildDeepSeekWebModel(
+  templateValue: unknown,
+  route: DeepSeekWebModelRoute,
+): JsonObject {
+  const template = object(templateValue, `native ${NATIVE_TEMPLATE_MODEL} model`);
+  if (slug(template) !== NATIVE_TEMPLATE_MODEL) {
+    throw new Error(`DeepSeek Web model template must be ${NATIVE_TEMPLATE_MODEL}`);
+  }
+  const model: JsonObject = {
+    ...structuredClone(template),
+    slug: route.slug,
+    display_name: route.displayName,
+    description: route.description,
+    input_modalities: ["text"],
+    visibility: "list",
+    supported_in_api: false,
+    tool_mode: null,
+    upgrade: null,
+    default_reasoning_level: route.codexEffort,
+    supported_reasoning_levels: [reasoningLevel(template, route.codexEffort, route.displayName)],
+    additional_speed_tiers: [],
+    service_tiers: [],
+    default_service_tier: null,
+    context_window: DEEPSEEK_WEB_CONTEXT_WINDOW,
+    max_context_window: DEEPSEEK_WEB_CONTEXT_WINDOW,
+    auto_compact_token_limit: DEEPSEEK_WEB_AUTO_COMPACT_TOKEN_LIMIT,
+  };
+  delete model.comp_hash;
+  delete model.availability_nux;
+  return model;
+}
+
 export function augmentNativeModelCatalog(
   value: unknown,
   config: AppConfig,
@@ -85,7 +124,11 @@ export function augmentNativeModelCatalog(
   // advertising native models here lets Codex select one and silently bypass the
   // browser route. Full mode intentionally preserves native passthrough.
   const nativeModels = config.mode === "full"
-    ? structuredClone(catalog.models.filter(model => !slug(model)?.startsWith(CHATGPT_WEB_MODEL_PREFIX)))
+    ? structuredClone(catalog.models.filter(model => {
+      const modelSlug = slug(model);
+      return !modelSlug?.startsWith(CHATGPT_WEB_MODEL_PREFIX)
+        && !modelSlug?.startsWith(DEEPSEEK_WEB_MODEL_PREFIX);
+    }))
     : [];
   if (contextOverride) {
     const selected = nativeModels.find(model => slug(model) === contextOverride.model);
@@ -101,10 +144,12 @@ export function augmentNativeModelCatalog(
       }
     }
   }
-  const webModels = availableChatGptWebModelRoutes(config.proAvailable)
+  const chatGptWebModels = availableChatGptWebModelRoutes(config.proAvailable)
     .map(route => buildChatGptWebModel(template, route, config));
+  const deepSeekWebModels = availableDeepSeekWebModelRoutes(config.deepSeekWeb?.enabled === true)
+    .map(route => buildDeepSeekWebModel(template, route));
   return {
     ...structuredClone(catalog),
-    models: [...nativeModels, ...webModels],
+    models: [...nativeModels, ...chatGptWebModels, ...deepSeekWebModels],
   };
 }

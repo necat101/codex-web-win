@@ -1,7 +1,13 @@
 import { createChatGptWebAdapter } from "./adapters/chatgpt-web";
-import { adapterErrorEvent } from "./adapters/base";
+import { AdapterTurnError, adapterErrorEvent } from "./adapters/base";
 import { closeChatGptBrowserWorkers } from "./adapters/chatgpt-web/browser-worker";
 import { closeTurnBrokers } from "./adapters/chatgpt-web/turn-broker";
+import { createDeepSeekWebAdapter } from "./adapters/deepseek-web";
+import {
+  activeDeepSeekBrowserTurns,
+  cancelDeepSeekBrowserTurns,
+  closeDeepSeekBrowserWorkers,
+} from "./adapters/deepseek-web/browser-worker";
 import { timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, type Server as NodeHttpServer, type ServerResponse } from "node:http";
 import { Readable } from "node:stream";
@@ -21,6 +27,11 @@ import {
   requireChatGptWebModelRoute,
   type ChatGptWebModelRoute,
 } from "./chatgpt-web-models";
+import {
+  isDeepSeekWebModelSlug,
+  requireDeepSeekWebModelRoute,
+  type DeepSeekWebModelRoute,
+} from "./deepseek-web-models";
 import { forwardNativeCodexRequest, type NativeFetch } from "./native-passthrough";
 import { parseRequest } from "./responses/parser";
 import { buildCompactV1Output, COMPACT_PROMPT, extractCompactUserMessages } from "./responses/compaction";
@@ -34,6 +45,7 @@ export async function shutdownChatGptRuntime(): Promise<void> {
   chatGptTurnSessions.clear();
   await Promise.all([
     closeChatGptBrowserWorkers(),
+    closeDeepSeekBrowserWorkers(),
     closeTurnBrokers(),
   ]);
 }
@@ -101,6 +113,29 @@ export function routeChatGptWebRequest(parsed: CodexParsedRequest, config: AppCo
   parsed.modelId = CHATGPT_WEB_BACKEND_MODEL;
   parsed.options.reasoning = route.adapterEffort;
   return route;
+}
+
+export type ManagedWebModelRoute =
+  | { provider: "chatgpt-web"; route: ChatGptWebModelRoute }
+  | { provider: "deepseek-web"; route: DeepSeekWebModelRoute };
+
+type LocalCompactionModelRoute = ManagedWebModelRoute["route"];
+
+export function isManagedWebModelSlug(modelId: string): boolean {
+  return isChatGptWebModelSlug(modelId) || isDeepSeekWebModelSlug(modelId);
+}
+
+export function routeManagedWebRequest(parsed: CodexParsedRequest, config: AppConfig): ManagedWebModelRoute {
+  if (isChatGptWebModelSlug(parsed.modelId)) {
+    return { provider: "chatgpt-web", route: routeChatGptWebRequest(parsed, config) };
+  }
+  if (isDeepSeekWebModelSlug(parsed.modelId)) {
+    return {
+      provider: "deepseek-web",
+      route: requireDeepSeekWebModelRoute(parsed.modelId, config.deepSeekWeb?.enabled === true),
+    };
+  }
+  throw new Error(`Managed web model is not enabled: ${parsed.modelId}`);
 }
 
 export async function modelsRequest(
@@ -192,7 +227,7 @@ function compactSummaryFromResponse(response: Record<string, unknown>): string {
 
 async function localCompactionV2Response(
   parsed: CodexParsedRequest,
-  route: ChatGptWebModelRoute,
+  route: LocalCompactionModelRoute,
 ): Promise<Response> {
   const snapshot = await createLocalCompactionSnapshot(parsed._rawBody ?? {}, {
     kind: "responses-v2",
@@ -252,6 +287,70 @@ async function localCompactionV2Response(
   return Response.json(json);
 }
 
+async function localCompactionMessageResponse(
+  parsed: CodexParsedRequest,
+  route: LocalCompactionModelRoute,
+): Promise<Response> {
+  const snapshot = await createLocalCompactionSnapshot(parsed._rawBody ?? {}, {
+    kind: "responses-local",
+    model: route.slug,
+  });
+  console.info(
+    "[chatgpt-web] local compaction message snapshot="
+    + snapshot.snapshotId
+    + " archivedChars="
+    + String(snapshot.archivedChars)
+    + " recentChars="
+    + String(snapshot.recentChars),
+  );
+
+  const events: AdapterEvent[] = [
+    { type: "text_delta", text: snapshot.manifest },
+    { type: "done" },
+  ];
+  const maps = toolBridgeMaps(parsed);
+
+  if (parsed.stream) {
+    const queue = new AsyncEventQueue<AdapterEvent>();
+    for (const event of events) queue.push(event);
+    queue.close();
+    const stream = bridgeToResponsesSSE(
+      queue,
+      route.slug,
+      maps.toolNsMap,
+      maps.freeformToolNames,
+      maps.toolSearchToolNames,
+      undefined,
+      2_000,
+      {
+        hideThinkingSummary: true,
+        // Codex's local auto-compactor consumes ordinary assistant text. A synthetic compaction
+        // item is reserved for the separate remote-v2 compaction_trigger contract.
+        compaction: false,
+      },
+    );
+    return new Response(stream, {
+      headers: {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",
+      },
+    });
+  }
+
+  const json = buildResponseJSON(events, route.slug, {
+    hideThinkingSummary: true,
+    toolNsMap: maps.toolNsMap,
+    freeformToolNames: maps.freeformToolNames,
+    toolSearchToolNames: maps.toolSearchToolNames,
+    compaction: false,
+  });
+  // Do not retain this large internal summarizer exchange in previous_response_id state. Codex
+  // installs its answer as replacement history and the next request starts a fresh replay epoch.
+  return Response.json(json);
+}
+
 export async function responseRequest(req: Request, config: AppConfig): Promise<Response> {
   const nativeRequest = req.clone();
   let raw: unknown;
@@ -267,7 +366,7 @@ export async function responseRequest(req: Request, config: AppConfig): Promise<
   const requestedModel = raw && typeof raw === "object" && !Array.isArray(raw)
     ? (raw as { model?: unknown }).model
     : undefined;
-  if (typeof requestedModel === "string" && !isChatGptWebModelSlug(requestedModel)) {
+  if (typeof requestedModel === "string" && !isManagedWebModelSlug(requestedModel)) {
     if (config.mode === "browser-only") {
       return formatErrorResponse(
         400,
@@ -289,12 +388,22 @@ export async function responseRequest(req: Request, config: AppConfig): Promise<
   }
   const expanded = expandPreviousResponseInput(normalized);
   let parsed: CodexParsedRequest;
-  let route: ChatGptWebModelRoute;
+  let managedRoute: ManagedWebModelRoute;
   try {
     parsed = parseRequest(expanded);
-    route = routeChatGptWebRequest(parsed, config);
+    managedRoute = routeManagedWebRequest(parsed, config);
   } catch (error) {
     return formatErrorResponse(400, "invalid_request_error", error instanceof Error ? error.message : String(error));
+  }
+  const route = managedRoute.route;
+
+  if (parsed._localCompactionRequest === true) {
+    console.info("[chatgpt-web] V15.2 local message compaction route");
+    try {
+      return await localCompactionMessageResponse(parsed, route);
+    } catch (error) {
+      return formatErrorResponse(500, "server_error", error instanceof Error ? error.message : String(error));
+    }
   }
 
   if (parsed._compactionRequest === true) prepareCompactionTurn(parsed);
@@ -308,13 +417,21 @@ export async function responseRequest(req: Request, config: AppConfig): Promise<
     }
   }
 
-  const adapter = createChatGptWebAdapter(
-    providerConfig(config),
-  );
+  const adapter = managedRoute.provider === "deepseek-web"
+    ? createDeepSeekWebAdapter(providerConfig(config))
+    : createChatGptWebAdapter(providerConfig(config));
   try {
     await adapter.validateTurn?.(parsed, { headers: req.headers, abortSignal: req.signal });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
+    if (error instanceof AdapterTurnError) {
+      return new Response(JSON.stringify({
+        error: { message, type: error.errorType, code: error.code },
+      }), {
+        status: error.status,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
     // Current codex-rs treats a streamed response.failed with an unknown code as
     // retryable. Fail before committing SSE and use its explicit non-retryable
     // invalid_prompt code so a malformed trust envelope does not reconnect 5x.
@@ -397,7 +514,7 @@ export async function compactRequest(req: Request, config: AppConfig): Promise<R
   if (typeof raw.model !== "string" || !raw.model) {
     return formatErrorResponse(400, "invalid_request_error", "Compaction request requires a model");
   }
-  if (!isChatGptWebModelSlug(raw.model)) {
+  if (!isManagedWebModelSlug(raw.model)) {
     if (config.mode === "browser-only") {
       return formatErrorResponse(
         400,
@@ -413,7 +530,7 @@ export async function compactRequest(req: Request, config: AppConfig): Promise<R
   }
 
   let parsed: CodexParsedRequest;
-  let route: ChatGptWebModelRoute;
+  let managedRoute: ManagedWebModelRoute;
   try {
     const normalized = normalizeCodexTurnMetadata({
       ...raw,
@@ -422,11 +539,12 @@ export async function compactRequest(req: Request, config: AppConfig): Promise<R
       tool_choice: "none",
     }, req.headers);
     parsed = parseRequest(expandPreviousResponseInput(normalized));
-    route = routeChatGptWebRequest(parsed, config);
+    managedRoute = routeManagedWebRequest(parsed, config);
     prepareCompactionTurn(parsed);
   } catch (error) {
     return formatErrorResponse(400, "invalid_request_error", error instanceof Error ? error.message : String(error));
   }
+  const route = managedRoute.route;
 
   console.info("[chatgpt-web] V15.1 local v1 compaction route");
   try {
@@ -556,7 +674,7 @@ export async function startServer(
   const httpTurns = new HttpTurnCounter();
   const activity = () => ({
     active_http_turns: httpTurns.count(),
-    active_browser_turns: chatGptTurnSessions.activeCount(),
+    active_browser_turns: chatGptTurnSessions.activeCount() + activeDeepSeekBrowserTurns(),
   });
   const controlAuthorized = (req: Request): boolean => {
     const header = req.headers.get("authorization") ?? "";
@@ -586,7 +704,7 @@ export async function startServer(
     }
     if (req.method === "POST" && url.pathname === "/admin/cancel-browser-turns") {
       if (!controlAuthorized(req)) return new Response("Unauthorized", { status: 401 });
-      const cancelled = chatGptTurnSessions.clear();
+      const cancelled = chatGptTurnSessions.clear() + cancelDeepSeekBrowserTurns();
       return Response.json({ status: "ok", cancelled_browser_turns: cancelled, ...activity() });
     }
     if (req.method === "POST" && url.pathname === "/admin/shutdown") {

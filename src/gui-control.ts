@@ -2,6 +2,7 @@ import { existsSync } from "node:fs";
 import { stdin } from "node:process";
 import { delimiter, join } from "node:path";
 import { browserLoginStateExists } from "./browser-login";
+import { deepSeekBrowserLoginStateExists } from "./deepseek-browser-login";
 import {
   defaultChromeExecutable,
   getConfigDir,
@@ -28,6 +29,9 @@ export interface GuiSetupRequest {
   mode: "browser-only" | "full";
   acknowledgedUnofficial: true;
   forceLogin?: boolean;
+  deepSeekEnabled?: boolean;
+  forceDeepSeekLogin?: boolean;
+  acknowledgedDeepSeek?: boolean;
   autoApproveToolCalls?: boolean;
   replaceCodexRoute?: boolean;
   port?: number;
@@ -55,6 +59,7 @@ export interface GuiStatus {
     port: number;
     appName: string;
     autoApproveToolCalls: boolean;
+    deepSeekAcknowledged: boolean;
     fullCredentials: {
       tunnelIdConfigured: boolean;
       runtimeKeyConfigured: boolean;
@@ -65,6 +70,8 @@ export interface GuiStatus {
     found: boolean;
   };
   loginReady: boolean;
+  deepSeekEnabled: boolean;
+  deepSeekLoginReady: boolean;
   codex: {
     applicationFound: boolean;
     executablePath?: string;
@@ -139,6 +146,9 @@ export function parseGuiSetupRequest(value: unknown): GuiSetupRequest {
     "mode",
     "acknowledgedUnofficial",
     "forceLogin",
+    "deepSeekEnabled",
+    "forceDeepSeekLogin",
+    "acknowledgedDeepSeek",
     "autoApproveToolCalls",
     "replaceCodexRoute",
     "port",
@@ -166,6 +176,9 @@ export function parseGuiSetupRequest(value: unknown): GuiSetupRequest {
     throw new Error("tunnelId must be tunnel_ followed by 32 lowercase hexadecimal characters");
   }
   const forceLogin = ownBoolean(raw, "forceLogin");
+  const deepSeekEnabled = ownBoolean(raw, "deepSeekEnabled");
+  const forceDeepSeekLogin = ownBoolean(raw, "forceDeepSeekLogin");
+  const acknowledgedDeepSeek = ownBoolean(raw, "acknowledgedDeepSeek");
   const autoApproveToolCalls = ownBoolean(raw, "autoApproveToolCalls");
   const replaceCodexRoute = ownBoolean(raw, "replaceCodexRoute");
   const chromeExecutablePath = ownString(raw, "chromeExecutablePath", 32 * 1024);
@@ -175,6 +188,9 @@ export function parseGuiSetupRequest(value: unknown): GuiSetupRequest {
     mode: raw.mode,
     acknowledgedUnofficial: true,
     ...(forceLogin !== undefined ? { forceLogin } : {}),
+    ...(deepSeekEnabled !== undefined ? { deepSeekEnabled } : {}),
+    ...(forceDeepSeekLogin !== undefined ? { forceDeepSeekLogin } : {}),
+    ...(acknowledgedDeepSeek !== undefined ? { acknowledgedDeepSeek } : {}),
     ...(autoApproveToolCalls !== undefined ? { autoApproveToolCalls } : {}),
     ...(replaceCodexRoute !== undefined ? { replaceCodexRoute } : {}),
     ...(port !== undefined ? { port: port as number } : {}),
@@ -212,6 +228,9 @@ export async function runGuiSetup(request: GuiSetupRequest): Promise<SetupResult
     mode: request.mode,
     acknowledgedUnofficial: true,
     forceLogin: request.forceLogin,
+    deepSeekEnabled: request.deepSeekEnabled,
+    forceDeepSeekLogin: request.forceDeepSeekLogin,
+    acknowledgedDeepSeek: request.acknowledgedDeepSeek,
     autoApproveToolCalls: request.autoApproveToolCalls,
     replaceCodexRoute: request.replaceCodexRoute,
     port: request.port,
@@ -342,6 +361,7 @@ export async function getGuiStatus(): Promise<GuiStatus> {
         port: config.port,
         appName: config.appName,
         autoApproveToolCalls: config.autoApproveToolCalls,
+        deepSeekAcknowledged: Boolean(config.deepSeekWeb?.acknowledgedAt),
         fullCredentials: {
           tunnelIdConfigured: reusableFullCredentials.tunnelId,
           runtimeKeyConfigured: reusableFullCredentials.runtimeKey,
@@ -353,6 +373,8 @@ export async function getGuiStatus(): Promise<GuiStatus> {
       found: existsSync(chromePath),
     },
     loginReady: config ? browserLoginStateExists(config) : false,
+    deepSeekEnabled: config?.deepSeekWeb?.enabled === true,
+    deepSeekLoginReady: config ? deepSeekBrowserLoginStateExists(config) : false,
     codex,
     session,
     startup: {

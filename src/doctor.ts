@@ -3,6 +3,10 @@ import type { AppConfig } from "./config";
 import { getConfigPath, loadConfig } from "./config";
 import { inspectCodexIntegration } from "./codex-integration";
 import { browserLoginStateExists, loginVerificationMarkerPath } from "./browser-login";
+import {
+  deepSeekBrowserLoginStateExists,
+  deepSeekLoginVerificationMarkerPath,
+} from "./deepseek-browser-login";
 import { getServiceStatus } from "./service";
 import { installedTunnelClientVersion, tunnelClientVersion, tunnelStatus } from "./tunnel";
 import { getTunnelServiceStatus } from "./tunnel-service";
@@ -94,6 +98,38 @@ export async function runDoctor(): Promise<DoctorReport> {
     checks.push({ id: "login", status: "error", message: "ChatGPT login verification marker is readable by other users" });
   } else {
     checks.push({ id: "login", status: "ok", message: "ChatGPT login state was verified in a fresh runtime context" });
+  }
+
+  if (config.deepSeekWeb?.enabled !== true) {
+    checks.push({
+      id: "deepseek-login",
+      status: "ok",
+      message: "DeepSeek Web is disabled; any previously stored login state remains private and retained",
+    });
+  } else if (!deepSeekBrowserLoginStateExists(config)) {
+    checks.push({
+      id: "deepseek-login",
+      status: "error",
+      message: "DeepSeek login state is missing or unverified; run `codex-chatgpt-web deepseek-login`",
+    });
+  } else if (!secureFile(config.deepSeekWeb.storageStatePath)) {
+    checks.push({
+      id: "deepseek-login",
+      status: "error",
+      message: `DeepSeek login state is readable by other users: ${config.deepSeekWeb.storageStatePath}`,
+    });
+  } else if (!secureFile(deepSeekLoginVerificationMarkerPath(config.deepSeekWeb.storageStatePath))) {
+    checks.push({
+      id: "deepseek-login",
+      status: "error",
+      message: "DeepSeek login verification marker is readable by other users",
+    });
+  } else {
+    checks.push({
+      id: "deepseek-login",
+      status: "ok",
+      message: "DeepSeek login state was verified independently from ChatGPT",
+    });
   }
 
   const codex = inspectCodexIntegration();

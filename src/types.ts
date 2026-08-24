@@ -31,11 +31,23 @@ export interface CodexParsedRequest {
    */
   _compactionRequest?: boolean;
   /**
+   * True when Codex local auto-compaction arrived as the ordinary no-id user message containing
+   * its exact checkpoint prompt. Unlike remote v2, this transport expects a normal assistant
+   * message, not a synthetic `compaction` item, and must never enter the live browser/tool turn.
+   */
+  _localCompactionRequest?: boolean;
+  /**
    * True when the current request newly introduced a stored compaction summary/marker. Historical
    * markers restored by previous_response_id expansion were already acknowledged and do not reset
    * provider-private continuation caches again on every later turn.
    */
   _contextCompactionBoundary?: boolean;
+  /**
+   * Stable digest of the newest stored compaction summary/marker in the request history. It keeps
+   * every round after a checkpoint on one fresh browser session while preventing the pre-checkpoint
+   * session (which may use the same native turn_id) from being replayed.
+   */
+  _contextCompactionEpoch?: string;
 }
 
 export interface CodexContext {
@@ -306,7 +318,7 @@ export interface CodexProviderConfig {
     brokerSocketPath?: string;
     /** Persisted, trusted Codex task authority used for follow-up turns that omit the envelope. */
     threadEnvironmentStatePath?: string;
-    /** Maximum duration of one complete browser response. */
+    /** Maximum time without observable browser progress before a response is cancelled. */
     turnTimeoutMs?: number;
     /** Keep the single controlled browser visible. */
     headed?: boolean;
@@ -316,5 +328,17 @@ export interface CodexProviderConfig {
     proAvailable?: boolean;
     /** Authorize per-call "Allow once" confirmation clicks for this connector. */
     autoApproveToolCalls?: boolean;
+  };
+  deepseekWeb?: {
+    /** DeepSeek Web is an explicit opt-in routed model family. */
+    enabled: boolean;
+    /** Independent Playwright storage state; never shared with ChatGPT. */
+    storageStatePath?: string;
+    /** System Chrome executable. The runtime never downloads a browser. */
+    chromeExecutablePath?: string;
+    /** Maximum time without observable browser progress before cancellation. */
+    turnTimeoutMs?: number;
+    /** Keep the controlled DeepSeek browser visible. */
+    headed?: boolean;
   };
 }

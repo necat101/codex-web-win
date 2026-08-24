@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { resolve } from "node:path";
 import { expandUserPath, resolveBrokerSocketPath } from "../../config";
-import { namespacedToolName, type AdapterEvent, type CodexContentPart, type CodexParsedRequest, type CodexProviderConfig, type CodexToolResultMessage, type CodexUsage } from "../../types";
+import { namespacedToolName, type AdapterEvent, type CodexContentPart, type CodexParsedRequest, type CodexProviderConfig, type CodexTool, type CodexToolResultMessage, type CodexUsage } from "../../types";
 import { AdapterTurnError, type ProviderAdapter } from "../base";
 import { parseDataUrl } from "../image";
 import { ChatGptBrowserWorker, DEFAULT_CHATGPT_TOOL_TURN_TIMEOUT_MS, DEFAULT_CHATGPT_TURN_TIMEOUT_MS } from "./browser-worker";
@@ -9,7 +9,7 @@ import { extractChatGptTurnEnvironment, extractChatGptTurnIdentity } from "./env
 import { resolveChatGptWebModelMode, type ChatGptWebCapabilities } from "./model";
 import { chatGptReadOnlyContextWarning, compileChatGptWebPrompt } from "./prompt";
 import { TurnBroker, type BrokerToolRequest, type BrokerToolResult } from "./turn-broker";
-import { ChatGptTextFeed, ChatGptTraceFeed, chatGptTurnExecutionKey, chatGptTurnSessions, type ChatGptBrowserOutcome, type ChatGptTraceEvent, type ChatGptTurnRuntime, type ChatGptTurnSession } from "./turn-execution";
+import { ChatGptHeartbeatFeed, ChatGptTextFeed, ChatGptTraceFeed, chatGptTurnExecutionFamilyKey, chatGptTurnExecutionKey, chatGptTurnSessions, type ChatGptBrowserOutcome, type ChatGptTraceEvent, type ChatGptTurnRuntime, type ChatGptTurnSession } from "./turn-execution";
 import { estimateChatGptWebUsage } from "./usage";
 import { sharedChatGptThreadEnvironmentStore } from "./thread-environment";
 const CHATGPT_POST_TOOL_YIELD_MS = 650;
@@ -279,8 +279,8 @@ function brokerResultGroup(group: CurrentToolResultGroup): BrokerToolResult {
     },
   };
 }
-function validateBatchTools(parsed: CodexParsedRequest, requests: BrokerToolRequest[]): void {
-  const available = new Set((parsed.context.tools ?? []).map(tool => namespacedToolName(tool.namespace, tool.name)));
+export function validateBatchTools(tools: CodexTool[], requests: BrokerToolRequest[]): void {
+  const available = new Set(tools.map(tool => namespacedToolName(tool.namespace, tool.name)));
   for (const request of requests) {
     if (!available.has(request.wireName)) {
       throw new Error(`ChatGPT requested a tool that the active Codex round did not advertise: ${request.wireName}`);
@@ -329,6 +329,7 @@ export function createChatGptWebAdapter(provider: CodexProviderConfig): Provider
   ): ChatGptTurnRuntime => {
     const mode = resolveChatGptWebModelMode(parsed.modelId, parsed.options.reasoning, capabilities);
     const browserAbort = new AbortController();
+    const heartbeat = new ChatGptHeartbeatFeed();
     const trace = new ChatGptTraceFeed();
     const text = new ChatGptTextFeed();
     if (!mode.localTools) {
@@ -339,6 +340,7 @@ export function createChatGptWebAdapter(provider: CodexProviderConfig): Provider
         capabilities,
         prepare: async () => ({ ...compileChatGptWebPrompt(parsed, capabilities), release: () => {} }),
         abortSignal: browserAbort.signal,
+        onHeartbeat: () => heartbeat.pulse(),
         onReasoningSummary: text => trace.push({ kind: "reasoning", text }),
         onCommentary: (text, continuation) => trace.push({ kind: "commentary", text, ...(continuation ? { continuation: true } : {}) }),
         onTextDelta: delta => text.push(delta),
@@ -346,6 +348,7 @@ export function createChatGptWebAdapter(provider: CodexProviderConfig): Provider
       return {
         mode: "read-only",
         browser,
+        heartbeat,
         trace,
         text,
         cancel: () => browserAbort.abort(),
@@ -362,6 +365,13 @@ export function createChatGptWebAdapter(provider: CodexProviderConfig): Provider
       capabilities,
       prepare: async () => {
         const turnToken = await broker.register(environment, toolTimeoutMs + 60_000, traceId);
+        // Compaction can supersede this runtime while registration is still in
+        // flight. In that case cancel() has not seen an active token to revoke;
+        // close the just-created channel before exposing it to either side.
+        if (browserAbort.signal.aborted) {
+          broker.revoke(turnToken);
+          throw new DOMException("ChatGPT web turn aborted", "AbortError");
+        }
         activeToken = turnToken;
         tokenSettled = true;
         token.resolve(turnToken);
@@ -374,9 +384,13 @@ export function createChatGptWebAdapter(provider: CodexProviderConfig): Provider
         }
       },
       abortSignal: browserAbort.signal,
+      onHeartbeat: () => heartbeat.pulse(),
       onReasoningSummary: text => trace.push({ kind: "reasoning", text }),
       onCommentary: (text, continuation) => trace.push({ kind: "commentary", text, ...(continuation ? { continuation: true } : {}) }),
       onTextDelta: delta => text.push(delta),
+      onActivity: () => {
+        if (activeToken) broker.renew(activeToken);
+      },
       pendingToolCount: () => activeToken ? broker.pendingToolCount(activeToken) : 0,
       waitForPendingToolCountChange: (previousCount, timeoutMs) => activeToken
         ? broker.waitForPendingToolCountChange(activeToken, previousCount, timeoutMs, browserAbort.signal)
@@ -392,6 +406,7 @@ export function createChatGptWebAdapter(provider: CodexProviderConfig): Provider
       mode: "tools",
       token: token.promise,
       browser,
+      heartbeat,
       trace,
       text,
       cancel: () => {
@@ -412,9 +427,26 @@ export function createChatGptWebAdapter(provider: CodexProviderConfig): Provider
         ? validatedEnvironments.get(parsed)
         : resolveEnvironment(parsed);
       const executionKey = `${executionNamespace}:${chatGptTurnExecutionKey(parsed)}`;
+      const executionFamilyKey = `${executionNamespace}:${chatGptTurnExecutionFamilyKey(parsed)}`;
       const traceId = createHash("sha256").update(executionKey).digest("hex").slice(0, 12);
-      const session = chatGptTurnSessions.getOrCreate(executionKey, () => startRuntime(parsed, environment, traceId));
-      const heartbeat = setInterval(() => emit({ type: "heartbeat" }), 10_000);
+      const session = chatGptTurnSessions.getOrCreate(
+        executionKey,
+        () => startRuntime(parsed, environment, traceId),
+        executionFamilyKey,
+      );
+      let observedRuntimeHeartbeat = false;
+      // Browser-loop pulses begin only after prompt submission. Keep slow but
+      // bounded setup/model-selection/upload stages alive, then retire this
+      // request's bootstrap timer only when this invocation observes a fresh
+      // worker pulse. Session-global heartbeat history belongs to older Codex
+      // tool rounds and cannot prove that a queued replacement request is live.
+      const bootstrapHeartbeat = setInterval(() => {
+        if (observedRuntimeHeartbeat) {
+          clearInterval(bootstrapHeartbeat);
+          return;
+        }
+        emit({ type: "heartbeat" });
+      }, 10_000);
       try {
         emit({ type: "heartbeat" });
         await session.runExclusive(async () => {
@@ -443,10 +475,11 @@ export function createChatGptWebAdapter(provider: CodexProviderConfig): Provider
           }
 
           let turnToken: string | undefined;
+          let effectiveTools = environment?.tools ?? [];
           if (session.runtime.mode === "tools") {
             turnToken = await withAbort(session.runtime.token, incoming.abortSignal);
             if (!environment) throw new Error("Tool-capable ChatGPT web runtime lost its trusted environment");
-            broker.updateEnvironment(turnToken, environment);
+            effectiveTools = broker.updateEnvironment(turnToken, environment).tools;
 
             const outstanding = session.outstanding();
             if (outstanding.length > 0) {
@@ -524,6 +557,9 @@ export function createChatGptWebAdapter(provider: CodexProviderConfig): Provider
                   })
               : undefined;
             const browserOutcome = session.browserOutcome.then(outcome => ({ type: "browser" as const, outcome }));
+            let heartbeatSequence = session.runtime.heartbeat.value();
+            let nextHeartbeat = session.runtime.heartbeat.wait(heartbeatSequence, toolWaitAbort.signal)
+              .then(sequence => ({ type: "heartbeat" as const, sequence }));
             let nextTrace = session.runtime.trace.wait(toolWaitAbort.signal).then(() => ({ type: "trace" as const }));
             let nextText = session.runtime.text.wait(toolWaitAbort.signal).then(() => ({ type: "text" as const }));
             for (;;) {
@@ -531,11 +567,21 @@ export function createChatGptWebAdapter(provider: CodexProviderConfig): Provider
                 Promise.race([
                   ...(nextTools ? [nextTools] : []),
                   browserOutcome,
+                  nextHeartbeat,
                   nextTrace,
                   nextText,
                 ]),
                 incoming.abortSignal,
               );
+              if (next.type === "heartbeat") {
+                observedRuntimeHeartbeat = true;
+                clearInterval(bootstrapHeartbeat);
+                heartbeatSequence = next.sequence;
+                emit({ type: "heartbeat" });
+                nextHeartbeat = session.runtime.heartbeat.wait(heartbeatSequence, toolWaitAbort.signal)
+                  .then(sequence => ({ type: "heartbeat" as const, sequence }));
+                continue;
+              }
               if (next.type === "trace") {
                 emitNewTrace(session.runtime.trace.drain());
                 nextTrace = session.runtime.trace.wait(toolWaitAbort.signal).then(() => ({ type: "trace" as const }));
@@ -570,7 +616,7 @@ export function createChatGptWebAdapter(provider: CodexProviderConfig): Provider
               }
               const requests = session.takeStagedToolBatch();
               if (requests.length === 0) throw new Error("ChatGPT tool bridge returned an empty batch");
-              validateBatchTools(parsed, requests);
+              validateBatchTools(effectiveTools, requests);
               const roundReasoning = session.reasoningForActiveRoundReplay();
               const roundEvents = session.eventsForActiveRoundReplay();
               session.setOutstanding(requests, roundReasoning, roundEvents);
@@ -595,7 +641,7 @@ export function createChatGptWebAdapter(provider: CodexProviderConfig): Provider
         if (incoming.abortSignal?.aborted || isAbortError(error)) throw error;
         throw fatalChatGptWebTurnError(error);
       } finally {
-        clearInterval(heartbeat);
+        clearInterval(bootstrapHeartbeat);
       }
     },
   };

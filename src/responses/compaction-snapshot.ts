@@ -91,7 +91,7 @@ function boundedInteger(value: number | undefined, fallback: number, min: number
 
 export async function createLocalCompactionSnapshot(
   rawRequest: unknown,
-  metadata: { kind: "responses-v2" | "responses-compact-v1"; model?: string },
+  metadata: { kind: "responses-v2" | "responses-local" | "responses-compact-v1"; model?: string },
 ): Promise<LocalCompactionSnapshot> {
   const snapshotId = randomBytes(16).toString("hex");
   const createdAt = new Date().toISOString();
