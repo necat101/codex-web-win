@@ -11,7 +11,7 @@ import {
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
-import { tunnelClientVersion } from "../src/tunnel";
+import { tunnelClientBuildId, tunnelClientVersion } from "../src/tunnel";
 
 interface CommandResult {
   exitCode: number;
@@ -583,7 +583,28 @@ try {
   const repairedTunnel = repairedConfig.tunnel as Record<string, unknown> | undefined;
   assert(repairedTunnel?.tunnelId === tunnelId, "repair did not reuse the saved tunnel ID when the GUI omitted it");
   assert(normalized(String(repairedTunnel.runtimeKeyFile)) === normalized(runtimeKeyPath), "repair did not reuse the saved runtime-key file when the GUI omitted it");
+  assert(
+    normalized(String(repairedTunnel.binaryPath)) === normalized(managedTunnelClientPath),
+    "repair did not migrate the stale tunnel path to the managed replacement target",
+  );
   assert(fingerprint(runtimeKeyPath) === runtimeKeyBefore, "repair changed the saved runtime key");
+  const managedTunnelManifest = JSON.parse(readFileSync(managedTunnelManifestPath, "utf8")) as Record<string, unknown>;
+  const installedRuntimeManifest = JSON.parse(
+    readFileSync(join(libDir, packageVersion, "manifest.json"), "utf8"),
+  ) as Record<string, unknown>;
+  const expectedTunnelHash = installedRuntimeManifest.tunnelClientSha256;
+  const actualTunnelHash = createHash("sha256").update(readFileSync(managedTunnelClientPath)).digest("hex");
+  assert(managedTunnelManifest.version === 2, "repair did not replace the legacy tunnel manifest");
+  assert(
+    managedTunnelManifest.tunnelClientBuild === tunnelClientBuildId(),
+    "repair did not install the no-expiry tunnel-client build",
+  );
+  assert(
+    typeof expectedTunnelHash === "string"
+      && managedTunnelManifest.binarySha256 === expectedTunnelHash
+      && actualTunnelHash === expectedTunnelHash,
+    "repair did not preserve the attested no-expiry tunnel-client bytes",
+  );
 
   const postRepairResult = await run(launcher, ["gui", "status"], {
     env: environment,
@@ -608,13 +629,28 @@ try {
   assert(postRepair.loginReady === true, "verified isolated login fixture is not ready after repair");
   assert(postChrome?.found === true, "isolated Chrome fixture is not visible after repair");
 
-  // The remainder of this pre-existing smoke verifies foreground proxy ownership
-  // and graceful shutdown. A real Full session would require external tunnel
-  // connectivity, so make the test-only transition explicit after the Full repair
-  // regression has passed. The isolated shim accepts only the retirement stop
-  // command, records every invocation under this smoke root, and has no network
-  // or child-process capability.
-  assert(!existsSync(tunnelClientInvocationLogPath), "tunnel-client shim ran before explicit Full-mode retirement");
+  // Repair must stop the existing managed runtime before atomically replacing
+  // its legacy/official executable with the bundled no-expiry build. The
+  // isolated shim accepts only that stop command, records it under this smoke
+  // root, and has no network or child-process capability.
+  assert(existsSync(tunnelClientInvocationLogPath), "no-expiry migration replaced the managed tunnel-client without stopping it");
+  const migrationInvocations = readFileSync(tunnelClientInvocationLogPath, "utf8")
+    .split(/\r?\n/)
+    .filter(Boolean)
+    .map(line => line.split("\u001f"));
+  const expectedTunnelRetirement = ["runtimes", "stop", "codex-chatgpt-web", "--json"];
+  assert(migrationInvocations.length === 1, "no-expiry migration did not perform exactly one cleanup stop");
+  assert(
+    migrationInvocations.every(invocation => JSON.stringify(invocation) === JSON.stringify(expectedTunnelRetirement)),
+    "no-expiry migration invoked an unexpected legacy tunnel-client command",
+  );
+  const tunnelLogAfterMigration = fingerprint(tunnelClientInvocationLogPath);
+
+  // The remainder of this pre-existing smoke verifies foreground proxy
+  // ownership and graceful shutdown. A real Full session would require
+  // external tunnel connectivity, so make the test-only transition explicit
+  // after the Full repair regression has passed. That transition now uses the
+  // installed patched client, not the retired fixture shim.
   const explicitBrowserOnlyRequest = `${JSON.stringify({
     mode: "browser-only",
     acknowledgedUnofficial: true,
@@ -640,16 +676,9 @@ try {
     explicitBrowserOnlyResult.status === "complete" && explicitBrowserOnlyResult.mode === "browser-only",
     "explicit test-only Browser-only transition did not complete",
   );
-  assert(existsSync(tunnelClientInvocationLogPath), "explicit Full-mode retirement did not invoke the isolated tunnel-client shim");
-  const tunnelClientInvocations = readFileSync(tunnelClientInvocationLogPath, "utf8")
-    .split(/\r?\n/)
-    .filter(Boolean)
-    .map(line => line.split("\u001f"));
-  const expectedTunnelRetirement = ["runtimes", "stop", "codex-chatgpt-web", "--json"];
-  assert(tunnelClientInvocations.length === 1, "Full-mode retirement did not perform exactly one cleanup stop");
   assert(
-    tunnelClientInvocations.every(invocation => JSON.stringify(invocation) === JSON.stringify(expectedTunnelRetirement)),
-    "Full-mode retirement invoked an unexpected tunnel-client command",
+    fingerprint(tunnelClientInvocationLogPath) === tunnelLogAfterMigration,
+    "explicit Full-mode retirement unexpectedly reused the replaced legacy tunnel-client shim",
   );
 
   // Exercise the complementary upgrade case independently: a saved Full-mode

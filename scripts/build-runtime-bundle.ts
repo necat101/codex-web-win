@@ -2,6 +2,11 @@ import { createHash } from "node:crypto";
 import { chmodSync, copyFileSync, cpSync, existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { VERSION } from "../src/version";
+import {
+  buildNoExpiryTunnelClient,
+  TUNNEL_CLIENT_BUILD_ID,
+  type PatchedTunnelClientArtifact,
+} from "./build-no-expiry-tunnel-client";
 
 const NODE_VERSION = "24.14.0";
 const NODE_WINDOWS_ARCHIVE_SHA256: Record<string, string> = {
@@ -13,6 +18,7 @@ const output = resolve(process.argv[2] ?? join(root, "dist", "runtime"));
 const appDir = join(output, "app");
 const runtimeDir = join(output, "runtime");
 const binDir = join(output, "bin");
+const vendorDir = join(output, "vendor");
 const windows = process.platform === "win32";
 const runtimeExecutable = windows ? "node.exe" : "bun";
 const launcherName = windows ? "codex-chatgpt-web.exe" : "codex-chatgpt-web";
@@ -75,6 +81,22 @@ rmSync(output, { recursive: true, force: true });
 mkdirSync(appDir, { recursive: true });
 mkdirSync(runtimeDir, { recursive: true });
 mkdirSync(binDir, { recursive: true });
+mkdirSync(vendorDir, { recursive: true });
+
+let tunnelClient: PatchedTunnelClientArtifact | undefined;
+if (windows) {
+  tunnelClient = await buildNoExpiryTunnelClient();
+  const tunnelVendorDir = join(vendorDir, "tunnel-client");
+  mkdirSync(tunnelVendorDir, { recursive: true });
+  copyFileSync(tunnelClient.binaryPath, join(tunnelVendorDir, tunnelClient.binaryName));
+  copyFileSync(tunnelClient.licensePath, join(tunnelVendorDir, "LICENSE.txt"));
+  copyFileSync(tunnelClient.noticePath, join(tunnelVendorDir, "NOTICE.txt"));
+  copyFileSync(tunnelClient.receiptPath, join(tunnelVendorDir, "BUILD-RECEIPT.json"));
+  copyFileSync(
+    join(root, "patches", "tunnel-client-v0.0.12-no-expiry.patch"),
+    join(tunnelVendorDir, "NO-EXPIRY.patch"),
+  );
+}
 
 const build = await Bun.build({
   entrypoints: [join(root, "src", "cli.ts")],
@@ -217,6 +239,10 @@ writeFileSync(join(output, "manifest.json"), `${JSON.stringify({
     supervisor: `bin/${launcherName}`,
     gui: `bin/${windowsGuiName}`,
     uninstaller: `bin/${windowsUninstallerName}`,
+    tunnelClientBuild: TUNNEL_CLIENT_BUILD_ID,
+    tunnelClientTarget: tunnelClient!.target,
+    tunnelClientPath: `vendor/tunnel-client/${tunnelClient!.binaryName}`,
+    tunnelClientSha256: tunnelClient!.sha256,
   } : {}),
   entrypoint: "app/cli.js",
   playwright: JSON.parse(readFileSync(playwrightPackage, "utf8")).version,

@@ -23,6 +23,10 @@ interface RuntimeManifest {
   appVersion?: string;
   platform?: string;
   launcher?: string;
+  tunnelClientBuild?: string;
+  tunnelClientTarget?: string;
+  tunnelClientPath?: string;
+  tunnelClientSha256?: string;
 }
 
 const projectRoot = resolve(import.meta.dir, "..");
@@ -31,7 +35,7 @@ const packageMetadata = JSON.parse(
 ) as PackageMetadata;
 const packageVersion = packageMetadata.version;
 const setupPath = resolve(
-  process.argv[2] ?? join(projectRoot, "dist", "codex-chatgpt-web-windows-x64-setup.exe"),
+  process.argv[2] ?? join(projectRoot, "dist", `codex-chatgpt-web-windows-${process.arch}-setup.exe`),
 );
 const smokePrefix = "codex-chatgpt-web-installer-smoke-";
 
@@ -91,6 +95,19 @@ function powershellPath(): string {
 async function captureUserIntegrationState(): Promise<string> {
   const script = String.raw`
 $ErrorActionPreference = "Stop"
+function Get-SmokeSha256([string]$path) {
+  $stream = [IO.File]::OpenRead($path)
+  try {
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {
+      return ([BitConverter]::ToString($sha.ComputeHash($stream))).Replace("-", "")
+    } finally {
+      $sha.Dispose()
+    }
+  } finally {
+    $stream.Dispose()
+  }
+}
 $shortcutName = "Codex ChatGPT Web.lnk"
 $shortcutPaths = @(
   (Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::Programs)) $shortcutName),
@@ -100,7 +117,7 @@ $shortcuts = foreach ($path in $shortcutPaths) {
   if (Test-Path -LiteralPath $path -PathType Leaf) {
     [ordered]@{
       path = $path
-      sha256 = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash
+      sha256 = Get-SmokeSha256 $path
     }
   } else {
     [ordered]@{ path = $path; sha256 = $null }
@@ -254,6 +271,55 @@ try {
   assert(manifest.appVersion === packageVersion, `installed manifest version is ${manifest.appVersion}; expected ${packageVersion}`);
   assert(manifest.platform === "win32", `installed manifest platform is ${manifest.platform}`);
   assert(manifest.launcher === "bin/codex-chatgpt-web.exe", `unexpected installed launcher: ${manifest.launcher}`);
+  const expectedTunnelTarget = process.arch === "arm64" ? "windows-arm64" : "windows-amd64";
+  assert(manifest.tunnelClientBuild === "0.0.12-codexweb-no-expiry.1", `unexpected installed tunnel-client build: ${manifest.tunnelClientBuild}`);
+  assert(manifest.tunnelClientTarget === expectedTunnelTarget, `unexpected installed tunnel-client target: ${manifest.tunnelClientTarget}`);
+  assert(manifest.tunnelClientPath === "vendor/tunnel-client/tunnel-client.exe", `unexpected installed tunnel-client path: ${manifest.tunnelClientPath}`);
+  assert(typeof manifest.tunnelClientSha256 === "string" && /^[0-9a-f]{64}$/.test(manifest.tunnelClientSha256), "installed tunnel-client hash is missing or invalid");
+
+  const expectedVendorDir = join(projectRoot, "dist", "runtime", "vendor", "tunnel-client");
+  const installedVendorDir = join(installedRuntime, "vendor", "tunnel-client");
+  const vendorNames = ["tunnel-client.exe", "LICENSE.txt", "NOTICE.txt", "BUILD-RECEIPT.json", "NO-EXPIRY.patch"];
+  const vendorHashes: string[] = [];
+  for (const name of vendorNames) {
+    const expectedPath = join(expectedVendorDir, name);
+    const installedPath = join(installedVendorDir, name);
+    assert(existsSync(expectedPath), `release runtime vendor payload is missing: ${expectedPath}`);
+    assert(existsSync(installedPath), `installed vendor payload is missing: ${installedPath}`);
+    assertWithin(root, installedPath, `installed ${name}`);
+    const expectedHash = createHash("sha256").update(readFileSync(expectedPath)).digest("hex");
+    const installedHash = createHash("sha256").update(readFileSync(installedPath)).digest("hex");
+    assert(installedHash === expectedHash, `installer changed vendor payload ${name}`);
+    vendorHashes.push(installedHash);
+  }
+  assert(vendorHashes[0] === manifest.tunnelClientSha256, "installed tunnel-client hash does not match the runtime manifest");
+  const tunnelReceipt = JSON.parse(readFileSync(join(installedVendorDir, "BUILD-RECEIPT.json"), "utf8")) as Record<string, unknown>;
+  assert(tunnelReceipt.schemaVersion === 1, "installed tunnel-client receipt has an unsupported schema");
+  assert(tunnelReceipt.buildId === manifest.tunnelClientBuild, "installed tunnel-client receipt has the wrong build ID");
+  assert(tunnelReceipt.target === expectedTunnelTarget.replace("-", "/"), "installed tunnel-client receipt has the wrong target");
+  assert(tunnelReceipt.binarySha256 === manifest.tunnelClientSha256, "installed tunnel-client receipt has the wrong binary hash");
+  assert(tunnelReceipt.upstreamCommit === "881c9a8fed7cccbe6607cd419863bbca506b8215", "installed tunnel-client receipt has the wrong upstream commit");
+
+  const installedTunnelClient = join(installedVendorDir, "tunnel-client.exe");
+  const tunnelVersion = await run(installedTunnelClient, ["--version"], { env: environment, timeoutMs: 15_000 });
+  assert(tunnelVersion.exitCode === 0, `installed tunnel-client --version failed: ${tunnelVersion.stderr || tunnelVersion.stdout}`);
+  assert(`${tunnelVersion.stdout}\n${tunnelVersion.stderr}`.includes("881c9a8fed7cccbe6607cd419863bbca506b8215-codexweb-no-expiry.1"), "installed tunnel-client does not report the pinned no-expiry build");
+  const tunnelDoctor = await run(installedTunnelClient, [
+    "doctor",
+    "--control-plane.tunnel-id", "tunnel_0123456789abcdef0123456789abcdef",
+    "--mcp.command", "cmd.exe",
+    "--health.listen-addr", "127.0.0.1:0",
+    "--json",
+  ], {
+    env: {
+      ...environment,
+      CONTROL_PLANE_API_KEY: "synthetic-runtime-key",
+      MCP_CONNECTION_MAX_TTL: "0s",
+    },
+    timeoutMs: 15_000,
+  });
+  assert(tunnelDoctor.exitCode === 0, `installed tunnel-client rejected disabled TTL: ${tunnelDoctor.stderr || tunnelDoctor.stdout}`);
+  assert((JSON.parse(tunnelDoctor.stdout) as { result?: string }).result === "ok", "installed tunnel-client doctor did not report success with disabled TTL");
 
   const launcherSidecar = decodeSidecar(launcherSidecarPath, 5);
   const installSidecar = decodeSidecar(installSidecarPath, 11);
@@ -289,6 +355,7 @@ try {
     .update(launcherSidecar.raw)
     .update(installSidecar.raw)
     .update(manifestText)
+    .update(vendorHashes.join("\n"))
     .digest("hex");
   process.stdout.write(`WINDOWS_OFFLINE_INSTALLER_ISOLATION_SMOKE_OK ${packageVersion} ${evidenceHash}\n`);
 } finally {

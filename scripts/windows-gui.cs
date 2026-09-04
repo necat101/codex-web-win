@@ -20,7 +20,7 @@ internal static class GuiProgram
 {
     internal const string ProductName = "Codex ChatGPT Web";
     internal const string AppName = "codex-chatgpt-web-gui";
-    internal const string Version = "0.2.10";
+    internal const string Version = "0.2.18";
     internal const string WindowTitle = "Codex ChatGPT Web - Windows Control Center";
 
     [DllImport("user32.dll")]
@@ -434,6 +434,39 @@ internal static class GuiProgram
         {
             return false;
         }
+        if (config.TryGetValue("deepSeekWeb", out value))
+        {
+            Dictionary<string, object> deepSeek = value as Dictionary<string, object>;
+            object enabledValue;
+            bool deepSeekIsEnabled;
+            string deepSeekStatePath;
+            if (deepSeek == null ||
+                !deepSeek.TryGetValue("enabled", out enabledValue) || !(enabledValue is bool) ||
+                !TryRequiredString(deepSeek, "storageStatePath", out deepSeekStatePath) ||
+                !Path.IsPathRooted(deepSeekStatePath))
+            {
+                return false;
+            }
+            try
+            {
+                if (String.Equals(
+                    Path.GetFullPath(storageStatePath),
+                    Path.GetFullPath(deepSeekStatePath),
+                    StringComparison.OrdinalIgnoreCase))
+                {
+                    return false;
+                }
+            }
+            catch
+            {
+                return false;
+            }
+            deepSeekIsEnabled = (bool)enabledValue;
+            string deepSeekAcknowledgedAt;
+            bool hasDeepSeekAcknowledgement =
+                TryRequiredString(deepSeek, "acknowledgedAt", out deepSeekAcknowledgedAt);
+            if (deepSeekIsEnabled && !hasDeepSeekAcknowledgement) return false;
+        }
         if (mode == "full")
         {
             if (!config.TryGetValue("tunnel", out value)) return false;
@@ -574,6 +607,9 @@ internal sealed class MainWindow : Form
     private NumericUpDown port;
     private CheckBox acknowledgement;
     private CheckBox forceLogin;
+    private CheckBox deepSeekEnabled;
+    private CheckBox forceDeepSeekLogin;
+    private CheckBox deepSeekAcknowledgement;
     private CheckBox autoApprove;
     private CheckBox replaceRoute;
     private GroupBox fullOptions;
@@ -899,35 +935,63 @@ internal sealed class MainWindow : Form
         options.Controls.Add(replaceRoute);
         scroll.Controls.Add(options);
 
+        GroupBox deepSeek = new GroupBox();
+        deepSeek.Text = "4. Optional DeepSeek Web";
+        deepSeek.Location = new Point(4, 462);
+        deepSeek.Size = new Size(940, 116);
+        deepSeek.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
+        deepSeekEnabled = new CheckBox();
+        deepSeekEnabled.Text = "Enable DeepSeek Web Instant and Expert models";
+        deepSeekEnabled.AutoSize = true;
+        deepSeekEnabled.Location = new Point(20, 28);
+        forceDeepSeekLogin = new CheckBox();
+        forceDeepSeekLogin.Text = "Refresh DeepSeek login during setup";
+        forceDeepSeekLogin.AutoSize = true;
+        forceDeepSeekLogin.Location = new Point(420, 28);
+        forceDeepSeekLogin.Enabled = false;
+        deepSeekEnabled.CheckedChanged += delegate
+        {
+            forceDeepSeekLogin.Enabled = deepSeekEnabled.Checked;
+            if (!deepSeekEnabled.Checked) forceDeepSeekLogin.Checked = false;
+        };
+        deepSeekAcknowledgement = new CheckBox();
+        deepSeekAcknowledgement.Text = "I understand this automation is experimental and selecting DeepSeek sends that task context under DeepSeek's terms.";
+        deepSeekAcknowledgement.AutoSize = true;
+        deepSeekAcknowledgement.Location = new Point(20, 66);
+        deepSeek.Controls.Add(deepSeekEnabled);
+        deepSeek.Controls.Add(forceDeepSeekLogin);
+        deepSeek.Controls.Add(deepSeekAcknowledgement);
+        scroll.Controls.Add(deepSeek);
+
         acknowledgement = new CheckBox();
-        acknowledgement.Text = "I understand this is independent, unofficial browser automation that can break when ChatGPT changes.";
+        acknowledgement.Text = "I understand this is independent, unofficial browser automation that can break when either website changes.";
         acknowledgement.AutoSize = true;
-        acknowledgement.Location = new Point(12, 466);
+        acknowledgement.Location = new Point(12, 594);
         scroll.Controls.Add(acknowledgement);
 
         Label loginInstruction = new Label();
-        loginInstruction.Text = "When setup opens Chrome: sign in to ChatGPT, confirm the composer is visible, then close that Chrome window completely.";
-        loginInstruction.Location = new Point(12, 500);
+        loginInstruction.Text = "When setup opens Chrome: complete each requested provider sign-in, confirm its composer is visible, then close that Chrome window completely.";
+        loginInstruction.Location = new Point(12, 628);
         loginInstruction.Size = new Size(900, 38);
         loginInstruction.ForeColor = Color.FromArgb(125, 74, 0);
         scroll.Controls.Add(loginInstruction);
 
         setupButton = PrimaryButton("Set up and sign in");
-        setupButton.Location = new Point(12, 548);
+        setupButton.Location = new Point(12, 676);
         setupButton.Enabled = false;
         setupButton.Click += delegate { RunSetup(); };
         scroll.Controls.Add(setupButton);
         setupStatus = new Label();
         setupStatus.Text = "Ready";
         setupStatus.AutoSize = true;
-        setupStatus.Location = new Point(210, 558);
+        setupStatus.Location = new Point(210, 686);
         scroll.Controls.Add(setupStatus);
 
         Label fullGuide = new Label();
         fullGuide.Text = "Full mode final checklist (after setup):\r\n" +
             "1. Start runtime  2. Open ChatGPT Connectors  3. Attach and scan the chosen connector  4. Restart Codex\r\n" +
             "The tunnel cannot be verified until the foreground session is running.";
-        fullGuide.Location = new Point(12, 604);
+        fullGuide.Location = new Point(12, 732);
         fullGuide.Size = new Size(910, 64);
         fullGuide.ForeColor = Navy;
         scroll.Controls.Add(fullGuide);
@@ -1136,6 +1200,8 @@ internal sealed class MainWindow : Form
             if (!String.IsNullOrWhiteSpace(status.SetupAppName)) appName.Text = status.SetupAppName;
             if (!String.IsNullOrWhiteSpace(status.ChromePath)) chromePath.Text = status.ChromePath;
             autoApprove.Checked = status.SetupAutoApprove;
+            deepSeekEnabled.Checked = status.DeepSeekEnabled;
+            deepSeekAcknowledgement.Checked = status.DeepSeekAcknowledged;
             replaceRoute.Checked = status.CodexRouteRepairRequired;
             setupFieldsHydrated = true;
         }
@@ -1209,7 +1275,8 @@ internal sealed class MainWindow : Form
                 ? "Repair setup"
                 : "Set up and sign in";
             setupReady = cliVersionMatches && status.Configured && status.ConfigurationCurrent &&
-                status.ChromeFound && status.LoginReady;
+                status.ChromeFound && status.LoginReady &&
+                (!status.DeepSeekEnabled || status.DeepSeekLoginReady);
             observedSessionRunning = status.Running || ownedRunning;
             externalSessionRunning = status.Running && !ownedRunning;
             runtimeReady = cliVersionMatches && status.Running && status.Healthy && status.AcceptingTurns;
@@ -1262,6 +1329,10 @@ internal sealed class MainWindow : Form
             else if (!status.LoginReady)
             {
                 SetStatus("Login needed", "Refresh the stored ChatGPT login before starting the runtime.", false);
+            }
+            else if (status.DeepSeekEnabled && !status.DeepSeekLoginReady)
+            {
+                SetStatus("DeepSeek login needed", "Refresh the independently stored DeepSeek login before starting the runtime.", false);
             }
             else if (status.Running)
             {
@@ -1403,6 +1474,18 @@ internal sealed class MainWindow : Form
             acknowledgement.Focus();
             return;
         }
+        if (deepSeekEnabled.Checked && !deepSeekAcknowledgement.Checked)
+        {
+            ShowError("Please acknowledge DeepSeek's separate data boundary before enabling its models.");
+            deepSeekAcknowledgement.Focus();
+            return;
+        }
+        if (!deepSeekEnabled.Checked && forceDeepSeekLogin.Checked)
+        {
+            ShowError("Enable DeepSeek Web before requesting a DeepSeek login refresh.");
+            deepSeekEnabled.Focus();
+            return;
+        }
         if (requestedFullMode && String.IsNullOrWhiteSpace(tunnelId.Text) && !existingTunnelIdConfigured)
         {
             ShowError("Full mode requires a tunnel ID. Enter one, or repair a setup that already has one configured.");
@@ -1444,6 +1527,9 @@ internal sealed class MainWindow : Form
         AppendJsonPair(payload, "mode", requestedFullMode ? "full" : "browser-only", true);
         AppendJsonBoolean(payload, "acknowledgedUnofficial", true);
         AppendJsonBoolean(payload, "forceLogin", forceLogin.Checked);
+        AppendJsonBoolean(payload, "deepSeekEnabled", deepSeekEnabled.Checked);
+        AppendJsonBoolean(payload, "forceDeepSeekLogin", forceDeepSeekLogin.Checked);
+        AppendJsonBoolean(payload, "acknowledgedDeepSeek", deepSeekAcknowledgement.Checked);
         AppendJsonBoolean(payload, "autoApproveToolCalls", autoApprove.Checked);
         AppendJsonBoolean(payload, "replaceCodexRoute", replaceRoute.Checked);
         payload.Append(",\"port\":").Append(((int)port.Value).ToString(CultureInfo.InvariantCulture));
@@ -1462,7 +1548,9 @@ internal sealed class MainWindow : Form
         }
         payload.Append('}');
         string input = payload.ToString() + Environment.NewLine;
-        setupStatus.Text = "Chrome will open; finish sign-in and close it.";
+        setupStatus.Text = deepSeekEnabled.Checked
+            ? "Chrome may open for ChatGPT and DeepSeek; finish each sign-in and close it."
+            : "Chrome will open; finish ChatGPT sign-in and close it.";
         SetBusy(true);
         try
         {
@@ -1855,6 +1943,8 @@ internal sealed class MainWindow : Form
         internal bool ConfigurationCurrent;
         internal bool ChromeFound;
         internal bool LoginReady;
+        internal bool DeepSeekEnabled;
+        internal bool DeepSeekLoginReady;
         internal bool CodexInstalled;
         internal bool CodexRouteRepairRequired;
         internal bool Running;
@@ -1868,6 +1958,7 @@ internal sealed class MainWindow : Form
         internal int SetupPort;
         internal string SetupAppName;
         internal bool SetupAutoApprove;
+        internal bool DeepSeekAcknowledged;
         internal bool TunnelIdConfigured;
         internal bool RuntimeKeyConfigured;
     }
@@ -1894,11 +1985,15 @@ internal sealed class MainWindow : Form
             bool current;
             bool recoverable;
             bool login;
+            bool deepSeekConfigured;
+            bool deepSeekLogin;
             if (!TryStatusString(root, "version", out version) ||
                 !TryStatusBoolean(root, "configured", out configured) ||
                 !TryStatusBoolean(root, "configurationCurrent", out current) ||
                 !TryStatusBoolean(root, "configurationRecoverable", out recoverable) ||
                 !TryStatusBoolean(root, "loginReady", out login) ||
+                !TryStatusBoolean(root, "deepSeekEnabled", out deepSeekConfigured) ||
+                !TryStatusBoolean(root, "deepSeekLoginReady", out deepSeekLogin) ||
                 !root.TryGetValue("chrome", out value))
             {
                 return false;
@@ -1949,6 +2044,7 @@ internal sealed class MainWindow : Form
             int setupPort = 0;
             string setupAppName = null;
             bool setupAutoApprove = false;
+            bool deepSeekAcknowledged = false;
             bool tunnelIdConfigured = false;
             bool runtimeKeyConfigured = false;
             if (root.TryGetValue("setup", out value))
@@ -1959,6 +2055,7 @@ internal sealed class MainWindow : Form
                     !TryStatusInteger(setup, "port", 1, 65535, out setupPort) ||
                     !TryStatusString(setup, "appName", out setupAppName) ||
                     !TryStatusBoolean(setup, "autoApproveToolCalls", out setupAutoApprove) ||
+                    !TryStatusBoolean(setup, "deepSeekAcknowledged", out deepSeekAcknowledged) ||
                     !setup.TryGetValue("fullCredentials", out credentialsValue))
                 {
                     return false;
@@ -1979,6 +2076,8 @@ internal sealed class MainWindow : Form
             status.ConfigurationCurrent = current;
             status.ChromeFound = chromeFound;
             status.LoginReady = login;
+            status.DeepSeekEnabled = deepSeekConfigured;
+            status.DeepSeekLoginReady = deepSeekLogin;
             status.CodexInstalled = codexInstalled;
             status.CodexRouteRepairRequired = codexRouteRepairRequired;
             status.Running = running;
@@ -1995,6 +2094,7 @@ internal sealed class MainWindow : Form
             status.SetupPort = setupPort;
             status.SetupAppName = setupAppName;
             status.SetupAutoApprove = setupAutoApprove;
+            status.DeepSeekAcknowledged = deepSeekAcknowledged;
             status.TunnelIdConfigured = tunnelIdConfigured;
             status.RuntimeKeyConfigured = runtimeKeyConfigured;
             if (sessionStatus.TryGetValue("detail", out value))

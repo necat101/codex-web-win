@@ -1,4 +1,5 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 
 if (process.platform !== "win32") {
@@ -18,11 +19,18 @@ if (!existsSync(manifestPath)) {
   throw new Error(`Runtime manifest is missing: ${manifestPath}`);
 }
 const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as Record<string, unknown>;
+const tunnelClientTarget = process.arch === "arm64" ? "windows-arm64" : "windows-amd64";
+const tunnelClientPath = "vendor/tunnel-client/tunnel-client.exe";
 if (manifest.platform !== "win32"
   || manifest.arch !== process.arch
   || manifest.launcher !== "bin/codex-chatgpt-web.exe"
   || manifest.gui !== "bin/codex-chatgpt-web-gui.exe"
-  || manifest.uninstaller !== "bin/codex-chatgpt-web-uninstall.ps1") {
+  || manifest.uninstaller !== "bin/codex-chatgpt-web-uninstall.ps1"
+  || manifest.tunnelClientBuild !== "0.0.12-codexweb-no-expiry.1"
+  || manifest.tunnelClientTarget !== tunnelClientTarget
+  || manifest.tunnelClientPath !== tunnelClientPath
+  || typeof manifest.tunnelClientSha256 !== "string"
+  || !/^[0-9a-f]{64}$/.test(manifest.tunnelClientSha256)) {
   throw new Error(`Runtime is not a complete Windows GUI bundle: ${JSON.stringify(manifest)}`);
 }
 const appVersion = manifest.appVersion;
@@ -33,6 +41,12 @@ if (typeof appVersion !== "string"
   throw new Error("Runtime manifest appVersion must be a nonempty, single-line string");
 }
 const launcher = join(runtimeRoot, "bin", "codex-chatgpt-web.exe");
+const tunnelVendorDir = join(runtimeRoot, "vendor", "tunnel-client");
+const tunnelClient = join(tunnelVendorDir, "tunnel-client.exe");
+const tunnelReceipt = join(tunnelVendorDir, "BUILD-RECEIPT.json");
+const tunnelLicense = join(tunnelVendorDir, "LICENSE.txt");
+const tunnelNotice = join(tunnelVendorDir, "NOTICE.txt");
+const tunnelPatch = join(tunnelVendorDir, "NO-EXPIRY.patch");
 for (const required of [
   launcher,
   join(runtimeRoot, "bin", "codex-chatgpt-web-gui.exe"),
@@ -44,8 +58,28 @@ for (const required of [
   join(root, "LICENSES", "Bun-1.3.11.md"),
   join(root, "dist", "THIRD_PARTY_NOTICES.txt"),
   join(root, "docs", "windows.md"),
+  tunnelClient,
+  tunnelReceipt,
+  tunnelLicense,
+  tunnelNotice,
+  tunnelPatch,
 ]) {
   if (!existsSync(required)) throw new Error(`Offline setup input is missing: ${required}`);
+  if (statSync(required).size === 0) throw new Error(`Offline setup input is empty: ${required}`);
+}
+
+const tunnelClientSha256 = createHash("sha256").update(readFileSync(tunnelClient)).digest("hex");
+if (tunnelClientSha256 !== manifest.tunnelClientSha256) {
+  throw new Error(`Runtime tunnel-client SHA-256 does not match its manifest: ${tunnelClientSha256}`);
+}
+const tunnelBuildReceipt = JSON.parse(readFileSync(tunnelReceipt, "utf8")) as Record<string, unknown>;
+if (tunnelBuildReceipt.schemaVersion !== 1
+  || tunnelBuildReceipt.buildId !== manifest.tunnelClientBuild
+  || tunnelBuildReceipt.target !== tunnelClientTarget.replace("-", "/")
+  || tunnelBuildReceipt.binarySha256 !== tunnelClientSha256
+  || tunnelBuildReceipt.upstreamCommit !== "881c9a8fed7cccbe6607cd419863bbca506b8215"
+  || tunnelBuildReceipt.patch !== "patches/tunnel-client-v0.0.12-no-expiry.patch") {
+  throw new Error(`Runtime tunnel-client build receipt is invalid: ${JSON.stringify(tunnelBuildReceipt)}`);
 }
 
 const launcherVersion = Bun.spawnSync([launcher, "--version"], {

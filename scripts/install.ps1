@@ -18,7 +18,7 @@ param(
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
-$DefaultVersion = "0.2.10"
+$DefaultVersion = "0.2.18"
 $DocumentNames = @(
   "LICENSE",
   "NOTICE.md",
@@ -78,10 +78,30 @@ function Get-ExpectedHash {
   throw "checksums.txt has no SHA-256 entry for $Name"
 }
 
+function Get-Sha256Hex {
+  param([string]$Path)
+  # Windows PowerShell normally exposes Get-FileHash through
+  # Microsoft.PowerShell.Utility, but stripped-down/restricted module paths can
+  # omit that cmdlet. Use the framework SHA-256 implementation directly so the
+  # installer keeps enforcing the same integrity check without depending on a
+  # profile or optional module discovery.
+  $stream = [IO.File]::OpenRead($Path)
+  try {
+    $sha256 = [Security.Cryptography.SHA256]::Create()
+    try {
+      return ([BitConverter]::ToString($sha256.ComputeHash($stream))).Replace("-", "").ToLowerInvariant()
+    } finally {
+      $sha256.Dispose()
+    }
+  } finally {
+    $stream.Dispose()
+  }
+}
+
 function Assert-Hash {
   param([string]$Path, [string]$Name, [string]$ChecksumsPath)
   $expected = Get-ExpectedHash -ChecksumsPath $ChecksumsPath -Name $Name
-  $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $Path).Hash.ToLowerInvariant()
+  $actual = Get-Sha256Hex -Path $Path
   if ($actual -ne $expected) {
     throw "SHA-256 verification failed for $Name"
   }
@@ -596,23 +616,61 @@ try {
   $uninstallerSourcePath = Join-Path $stageDir "bin\codex-chatgpt-web-uninstall.ps1"
   $nodePath = Join-Path $stageDir "runtime\node.exe"
   $nodeLicensePath = Join-Path $stageDir "runtime\Node-24.14.0-LICENSE.txt"
+  $tunnelClientPath = Join-Path $stageDir "vendor\tunnel-client\tunnel-client.exe"
+  $tunnelReceiptPath = Join-Path $stageDir "vendor\tunnel-client\BUILD-RECEIPT.json"
+  $tunnelLicensePath = Join-Path $stageDir "vendor\tunnel-client\LICENSE.txt"
+  $tunnelNoticePath = Join-Path $stageDir "vendor\tunnel-client\NOTICE.txt"
+  $tunnelPatchPath = Join-Path $stageDir "vendor\tunnel-client\NO-EXPIRY.patch"
   if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf) -or
       -not (Test-Path -LiteralPath $launcherPath -PathType Leaf) -or
       -not (Test-Path -LiteralPath $guiPath -PathType Leaf) -or
       -not (Test-Path -LiteralPath $uninstallerSourcePath -PathType Leaf) -or
       -not (Test-Path -LiteralPath $nodePath -PathType Leaf) -or
-      -not (Test-Path -LiteralPath $nodeLicensePath -PathType Leaf)) {
+      -not (Test-Path -LiteralPath $nodeLicensePath -PathType Leaf) -or
+      -not (Test-Path -LiteralPath $tunnelClientPath -PathType Leaf) -or
+      -not (Test-Path -LiteralPath $tunnelReceiptPath -PathType Leaf) -or
+      -not (Test-Path -LiteralPath $tunnelLicensePath -PathType Leaf) -or
+      -not (Test-Path -LiteralPath $tunnelNoticePath -PathType Leaf) -or
+      -not (Test-Path -LiteralPath $tunnelPatchPath -PathType Leaf)) {
     throw "Windows runtime archive is incomplete"
   }
   $manifest = Get-Content -Raw -LiteralPath $manifestPath | ConvertFrom-Json
+  $expectedTunnelTarget = if ($assetArchitecture -eq "arm64") { "windows-arm64" } else { "windows-amd64" }
   if ($manifest.schemaVersion -ne 1 -or $manifest.appVersion -ne $Version -or
       $manifest.platform -ne "win32" -or $manifest.arch -ne $assetArchitecture -or
       $manifest.nodeVersion -ne "24.14.0" -or
       $manifest.launcher -ne "bin/codex-chatgpt-web.exe" -or
       $manifest.supervisor -ne "bin/codex-chatgpt-web.exe" -or
       $manifest.gui -ne "bin/codex-chatgpt-web-gui.exe" -or
-      $manifest.uninstaller -ne "bin/codex-chatgpt-web-uninstall.ps1") {
+      $manifest.uninstaller -ne "bin/codex-chatgpt-web-uninstall.ps1" -or
+      $manifest.tunnelClientBuild -ne "0.0.12-codexweb-no-expiry.1" -or
+      $manifest.tunnelClientTarget -ne $expectedTunnelTarget -or
+      $manifest.tunnelClientPath -ne "vendor/tunnel-client/tunnel-client.exe" -or
+      $manifest.tunnelClientSha256 -notmatch '^[0-9a-f]{64}$') {
     throw "Runtime manifest does not match Windows $assetArchitecture version $Version"
+  }
+  foreach ($vendorPath in @($tunnelClientPath, $tunnelReceiptPath, $tunnelLicensePath, $tunnelNoticePath, $tunnelPatchPath)) {
+    if ((Get-Item -Force -LiteralPath $vendorPath).Length -le 0) {
+      throw "Bundled no-expiry tunnel-client payload is empty: $vendorPath"
+    }
+  }
+  $actualTunnelHash = Get-Sha256Hex -Path $tunnelClientPath
+  if ($actualTunnelHash -ne $manifest.tunnelClientSha256) {
+    throw "Bundled no-expiry tunnel-client SHA-256 does not match the runtime manifest"
+  }
+  try {
+    $tunnelReceipt = Get-Content -Raw -LiteralPath $tunnelReceiptPath | ConvertFrom-Json
+  } catch {
+    throw "Bundled no-expiry tunnel-client build receipt is invalid"
+  }
+  $expectedReceiptTarget = if ($assetArchitecture -eq "arm64") { "windows/arm64" } else { "windows/amd64" }
+  if ($tunnelReceipt.schemaVersion -ne 1 -or
+      $tunnelReceipt.buildId -ne $manifest.tunnelClientBuild -or
+      $tunnelReceipt.target -ne $expectedReceiptTarget -or
+      $tunnelReceipt.binarySha256 -ne $actualTunnelHash -or
+      $tunnelReceipt.upstreamCommit -ne "881c9a8fed7cccbe6607cd419863bbca506b8215" -or
+      $tunnelReceipt.patch -ne "patches/tunnel-client-v0.0.12-no-expiry.patch") {
+    throw "Bundled no-expiry tunnel-client provenance does not match the runtime manifest"
   }
   $actualVersion = (& $launcherPath --version | Out-String).Trim()
   if ($LASTEXITCODE -ne 0 -or $actualVersion -ne $Version) {

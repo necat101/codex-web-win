@@ -1,6 +1,13 @@
+import { createHash } from "node:crypto";
 import { cpSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import {
+  requireTunnelClientTarget,
+  TUNNEL_CLIENT_BUILD_ID,
+  TUNNEL_CLIENT_UPSTREAM_COMMIT,
+  tunnelClientVendorPath,
+} from "../src/tunnel-client-artifact";
 
 const sourceBundle = resolve(process.argv[2] ?? "dist/runtime");
 const sourceRoot = resolve(import.meta.dir, "..");
@@ -30,6 +37,14 @@ const runtimeExecutable = join(runtimeRoot, "runtime", process.platform === "win
 const supervisor = launcher;
 const windowsGui = join(runtimeRoot, "bin", "codex-chatgpt-web-gui.exe");
 const windowsUninstaller = join(runtimeRoot, "bin", "codex-chatgpt-web-uninstall.ps1");
+const tunnelClientTarget = process.platform === "win32" ? requireTunnelClientTarget() : undefined;
+const bundledTunnelClient = tunnelClientTarget
+  ? join(runtimeRoot, tunnelClientVendorPath(tunnelClientTarget))
+  : join(runtimeRoot, "vendor", "tunnel-client", "tunnel-client");
+const bundledTunnelLicense = join(runtimeRoot, "vendor", "tunnel-client", "LICENSE.txt");
+const bundledTunnelNotice = join(runtimeRoot, "vendor", "tunnel-client", "NOTICE.txt");
+const bundledTunnelPatch = join(runtimeRoot, "vendor", "tunnel-client", "NO-EXPIRY.patch");
+const bundledTunnelReceipt = join(runtimeRoot, "vendor", "tunnel-client", "BUILD-RECEIPT.json");
 const internalSuperviseFlag = "--codex-chatgpt-web-internal-supervise";
 const cliBundle = readFileSync(join(runtimeRoot, "app", "cli.js"), "utf8");
 const launcherText = readFileSync(launcher, "utf8");
@@ -40,7 +55,7 @@ for (const forbidden of [sourceRoot, dirname(sourceBundle), "/private/tmp/codex-
 }
 
 const manifest = JSON.parse(readFileSync(join(runtimeRoot, "manifest.json"), "utf8")) as Record<string, unknown>;
-if (manifest.schemaVersion !== 1 || manifest.appVersion !== "0.2.10" || manifest.playwright !== "1.62.0"
+if (manifest.schemaVersion !== 1 || manifest.appVersion !== "0.2.18" || manifest.playwright !== "1.62.0"
   || manifest.platform !== process.platform || manifest.arch !== process.arch
   || manifest.launcher !== `bin/${launcherName}` || !existsSync(runtimeExecutable)
   || (process.platform === "win32"
@@ -48,9 +63,18 @@ if (manifest.schemaVersion !== 1 || manifest.appVersion !== "0.2.10" || manifest
       || manifest.supervisor !== "bin/codex-chatgpt-web.exe"
       || manifest.gui !== "bin/codex-chatgpt-web-gui.exe"
       || manifest.uninstaller !== "bin/codex-chatgpt-web-uninstall.ps1"
+      || manifest.tunnelClientBuild !== TUNNEL_CLIENT_BUILD_ID
+      || manifest.tunnelClientTarget !== tunnelClientTarget?.key
+      || manifest.tunnelClientPath !== (tunnelClientTarget ? tunnelClientVendorPath(tunnelClientTarget) : undefined)
+      || manifest.tunnelClientSha256 !== tunnelClientTarget?.binarySha256
       || !existsSync(supervisor)
       || !existsSync(windowsGui)
       || !existsSync(windowsUninstaller)
+      || !existsSync(bundledTunnelClient)
+      || !existsSync(bundledTunnelLicense)
+      || !existsSync(bundledTunnelNotice)
+      || !existsSync(bundledTunnelPatch)
+      || !existsSync(bundledTunnelReceipt)
       || !existsSync(join(runtimeRoot, "runtime", "Node-24.14.0-LICENSE.txt"))))) {
   throw new Error(`Unexpected runtime manifest: ${JSON.stringify(manifest)}`);
 }
@@ -62,8 +86,42 @@ const runtimeCommand = (args: string[]) => process.platform === "win32"
   ? [launcher, ...args]
   : [launcher, ...args];
 const version = Bun.spawnSync(launcherCommand(["--version"]), { stdout: "pipe", stderr: "pipe" });
-if (version.exitCode !== 0 || version.stdout.toString().trim() !== "0.2.10") {
+if (version.exitCode !== 0 || version.stdout.toString().trim() !== "0.2.18") {
   throw new Error(`Relocated launcher failed: ${version.stderr.toString()}`);
+}
+
+if (process.platform === "win32") {
+  if (!tunnelClientTarget) throw new Error(`Unsupported Windows tunnel-client target: ${process.arch}`);
+  const tunnelHash = createHash("sha256").update(readFileSync(bundledTunnelClient)).digest("hex");
+  if (tunnelHash !== tunnelClientTarget.binarySha256) {
+    throw new Error(`Bundled no-expiry tunnel-client hash mismatch: ${tunnelHash}`);
+  }
+  const tunnelVersion = Bun.spawnSync([bundledTunnelClient, "--version"], { stdout: "pipe", stderr: "pipe" });
+  const tunnelVersionText = `${tunnelVersion.stdout.toString()}\n${tunnelVersion.stderr.toString()}`;
+  if (tunnelVersion.exitCode !== 0
+    || !tunnelVersionText.includes(`${TUNNEL_CLIENT_UPSTREAM_COMMIT}-codexweb-no-expiry.1`)) {
+    throw new Error(`Bundled tunnel-client has the wrong build: ${tunnelVersionText}`);
+  }
+  const tunnelDoctor = Bun.spawnSync([
+    bundledTunnelClient,
+    "doctor",
+    "--control-plane.tunnel-id", "tunnel_0123456789abcdef0123456789abcdef",
+    "--mcp.command", "cmd.exe",
+    "--health.listen-addr", "127.0.0.1:0",
+    "--json",
+  ], {
+    env: {
+      ...process.env,
+      CONTROL_PLANE_API_KEY: "synthetic-runtime-key",
+      MCP_CONNECTION_MAX_TTL: "0s",
+    },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const doctorOutput = tunnelDoctor.stdout.toString();
+  if (tunnelDoctor.exitCode !== 0 || (JSON.parse(doctorOutput) as { result?: string }).result !== "ok") {
+    throw new Error(`Bundled tunnel-client rejected disabled TTL: ${tunnelDoctor.stderr.toString() || doctorOutput}`);
+  }
 }
 
 const appHome = join(root, "app-state");
@@ -75,7 +133,7 @@ const port = portServer.port;
 portServer.stop();
 const config = {
   version: 2,
-  releaseVersion: "0.2.10",
+  releaseVersion: "0.2.18",
   mode: "browser-only",
   host: "127.0.0.1",
   port,

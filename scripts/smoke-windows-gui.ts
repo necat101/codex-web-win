@@ -11,7 +11,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 interface CommandResult {
   exitCode: number;
@@ -371,8 +371,67 @@ try {
   const launcherStatusJson = parseSingleJson(launcherStatus.stdout, "launcher gui status");
   assert(launcherStatusJson.schemaVersion === 1, "launcher gui status has an unexpected schemaVersion");
   assert(typeof launcherStatusJson.configured === "boolean", "launcher gui status omitted its configured state");
+  assert(launcherStatusJson.deepSeekEnabled === false, "legacy GUI fixture unexpectedly enabled DeepSeek Web");
+  assert(typeof launcherStatusJson.deepSeekLoginReady === "boolean", "launcher GUI status omitted independent DeepSeek login readiness");
   const launcherStartup = launcherStatusJson.startup as Record<string, unknown> | undefined;
   assert(launcherStartup?.automatic === false, "launcher gui status does not preserve the no-autostart contract");
+
+  const browserDir = join(appHome, "browser");
+  const browserDirExisted = existsSync(browserDir);
+  const deepSeekStatePath = join(browserDir, "deepseek-storage-state.json");
+  const deepSeekMarkerPath = `${deepSeekStatePath}.verified.json`;
+  const temporaryRoot = normalized(tmpdir());
+  const durableRuntimeExecutable = (process.env.PATH ?? "")
+    .split(delimiter)
+    .map(directory => directory.trim().replace(/^"(.*)"$/, "$1"))
+    .filter(Boolean)
+    .flatMap(directory => process.platform === "win32"
+      ? [join(directory, "bun.exe"), join(directory, "node.exe")]
+      : [join(directory, "bun"), join(directory, "node")])
+    .find(candidate => {
+      if (!existsSync(candidate)) return false;
+      const path = normalized(candidate);
+      return path !== temporaryRoot && !path.startsWith(`${temporaryRoot}${sep}`);
+    });
+  assert(durableRuntimeExecutable, "DeepSeek-enabled GUI fixture requires a durable runtime executable on PATH");
+  mkdirSync(browserDir, { recursive: true });
+  writeFileSync(deepSeekStatePath, '{"cookies":[],"origins":[]}\n');
+  writeFileSync(deepSeekMarkerPath, `${JSON.stringify({
+    version: 1,
+    authenticated: true,
+    verifiedAt: "2026-08-23T00:00:00.000Z",
+    accountSurfaceUrl: "https://chat.deepseek.com/",
+  })}\n`);
+  writeFileSync(configPath, `${JSON.stringify({
+    ...config,
+    // The relocated fixture intentionally lives under the OS temp directory,
+    // which strict runtime validation rejects as non-durable. Point this
+    // enabled-provider status probe at a stable PATH runtime plus repository
+    // source so the CLI can load the complete config in both direct and
+    // release-verifier executions.
+    runtimeCommand: [durableRuntimeExecutable, join(sourceRoot, "src", "cli.ts")],
+    deepSeekWeb: {
+      enabled: true,
+      storageStatePath: deepSeekStatePath,
+      acknowledgedAt: "2026-08-23T00:00:00.000Z",
+    },
+  }, null, 2)}\n`);
+  const deepSeekStatus = await run(launcher, ["gui", "status"], { env: environment, cwd: relocated, timeoutMs: 15_000 });
+  assert(deepSeekStatus.exitCode === 0, `DeepSeek-enabled launcher gui status failed (${deepSeekStatus.exitCode}): ${deepSeekStatus.stderr}`);
+  assert(!`${deepSeekStatus.stdout}\n${deepSeekStatus.stderr}`.includes(secretCanary), "DeepSeek-enabled gui status disclosed a secret canary");
+  const deepSeekStatusJson = parseSingleJson(deepSeekStatus.stdout, "DeepSeek-enabled launcher gui status");
+  assert(
+    deepSeekStatusJson.deepSeekEnabled === true,
+    `launcher gui status did not expose enabled DeepSeek Web: ${JSON.stringify(deepSeekStatusJson)}`,
+  );
+  assert(deepSeekStatusJson.deepSeekLoginReady === true, "launcher gui status did not expose the independent verified DeepSeek login");
+  const deepSeekSetup = deepSeekStatusJson.setup as Record<string, unknown> | undefined;
+  assert(deepSeekSetup?.deepSeekAcknowledged === true, "launcher gui status omitted the persisted DeepSeek acknowledgement");
+  writeFileSync(configPath, validConfigText);
+  rmSync(deepSeekStatePath, { force: true });
+  rmSync(deepSeekMarkerPath, { force: true });
+  if (!browserDirExisted) rmSync(browserDir, { recursive: true, force: true });
+  assert(JSON.stringify(treeSnapshot(appHome)) === JSON.stringify(homeBefore), "DeepSeek-enabled gui status fixture did not restore private application state");
 
   const selfTest = await run(gui, ["--self-test"], { env: environment, cwd: relocated, timeoutMs: 15_000 });
   assert(!`${selfTest.stdout}\n${selfTest.stderr}`.includes(secretCanary), "--self-test disclosed a secret canary");
