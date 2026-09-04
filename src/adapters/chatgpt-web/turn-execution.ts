@@ -248,7 +248,6 @@ export function chatGptTurnExecutionFamilyKey(parsed: CodexParsedRequest): strin
 }
 
 export class ChatGptTurnSession {
-  readonly createdAt = Date.now();
   readonly browserOutcome: Promise<ChatGptBrowserOutcome>;
   private readonly outstandingById = new Map<string, BrokerToolRequest>();
   private readonly deliveredResultIds = new Set<string>();
@@ -261,7 +260,7 @@ export class ChatGptTurnSession {
   private settledBrowserOutcome?: ChatGptBrowserOutcome;
   private tail: Promise<void> = Promise.resolve();
 
-  constructor(readonly runtime: ChatGptTurnRuntime) {
+  constructor(readonly runtime: ChatGptTurnRuntime, readonly createdAt = Date.now()) {
     this.browserOutcome = runtime.browser
       .then(answer => ({ type: "final", answer }) as ChatGptBrowserOutcome)
       .catch(error => ({ type: "error", error: error instanceof Error ? error : new Error(String(error)) }) as ChatGptBrowserOutcome)
@@ -403,11 +402,16 @@ export class ChatGptTurnSessions {
   private readonly retiredAtByKey = new Map<string, number>();
 
   constructor(
-    private readonly ttlMs = 4 * 60 * 60_000,
+    private readonly settledRetentionMs = 4 * 60 * 60_000,
     private readonly maxEntries = 256,
+    private readonly now: () => number = Date.now,
   ) {}
 
-  getOrCreate(key: string, start: () => ChatGptTurnRuntime, familyKey = key): ChatGptTurnSession {
+  getOrCreate(
+    key: string,
+    start: () => ChatGptTurnRuntime,
+    familyKey = key,
+  ): ChatGptTurnSession {
     this.prune();
     const existing = this.entries.get(key);
     if (existing) {
@@ -436,7 +440,7 @@ export class ChatGptTurnSessions {
     }
 
     if (this.entries.size >= this.maxEntries) throw new Error(`ChatGPT web session registry is full (${this.maxEntries} entries)`);
-    const session = new ChatGptTurnSession(start());
+    const session = new ChatGptTurnSession(start(), this.now());
     this.entries.set(key, session);
     this.familyByKey.set(key, familyKey);
     this.currentKeyByFamily.set(familyKey, key);
@@ -461,13 +465,13 @@ export class ChatGptTurnSessions {
   }
 
   private prune(): void {
-    const cutoff = Date.now() - this.ttlMs;
+    const cutoff = this.now() - this.settledRetentionMs;
     for (const [key, retiredAt] of this.retiredAtByKey) {
       if (retiredAt < cutoff) this.retiredAtByKey.delete(key);
     }
     for (const [key, session] of this.entries) {
-      // Browser/broker runtimes own active-turn timeouts. Registry TTL only
-      // cleans up old settled sessions; it must not cancel legitimate work.
+      // This is replay/cache retention only. Active sessions are never aged
+      // out and can end only through their own completion or explicit cancel.
       if (session.createdAt >= cutoff || session.isActive()) continue;
       this.delete(key, true);
     }
@@ -477,7 +481,7 @@ export class ChatGptTurnSessions {
     // Refresh insertion order if an already-known key is encountered, then
     // keep the tombstone set bounded independently from the active registry.
     this.retiredAtByKey.delete(key);
-    this.retiredAtByKey.set(key, Date.now());
+    this.retiredAtByKey.set(key, this.now());
     const maxRetiredEntries = Math.max(16, this.maxEntries * 4);
     while (this.retiredAtByKey.size > maxRetiredEntries) {
       const oldest = this.retiredAtByKey.keys().next().value as string | undefined;

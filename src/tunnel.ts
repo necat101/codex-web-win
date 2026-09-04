@@ -1,105 +1,164 @@
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, readFileSync } from "node:fs";
-import { basename, dirname, join } from "node:path";
-import { unzipSync } from "fflate";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
 import type { AppConfig, TunnelConfig } from "./config";
-import { atomicWriteFile, getConfigDir } from "./config";
+import { atomicWriteFile, getConfigDir, saveConfig } from "./config";
 import { runCommand, runChecked } from "./process";
-import { getTunnelServiceStatus } from "./tunnel-service";
+import {
+  requireTunnelClientTarget,
+  TUNNEL_CLIENT_BUILD_ID as TUNNEL_BUILD_ID,
+  TUNNEL_CLIENT_UPSTREAM_COMMIT as TUNNEL_UPSTREAM_COMMIT,
+  TUNNEL_CLIENT_UPSTREAM_VERSION as TUNNEL_VERSION,
+  tunnelClientVendorPath,
+} from "./tunnel-client-artifact";
+import { getTunnelServiceStatus, TUNNEL_MCP_CONNECTION_MAX_TTL } from "./tunnel-service";
 
-const TUNNEL_VERSION = "0.0.11";
-const RELEASE_BASE = `https://github.com/openai/tunnel-client/releases/download/v${TUNNEL_VERSION}`;
-const MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024;
+const TUNNEL_REPORTED_BUILD_MARKER = `${TUNNEL_UPSTREAM_COMMIT}-codexweb-no-expiry.1`;
+const TUNNEL_RUNTIME_POLICY_VERSION = 2;
 
-interface TunnelInstallManifest {
-  version: 1;
+export interface TunnelInstallManifest {
+  version: 2;
   tunnelClientVersion: string;
-  asset: string;
-  archiveSha256: string;
+  tunnelClientBuild: string;
+  upstreamCommit: string;
   binarySha256: string;
+}
+
+/** Invalid/stale install metadata is replaceable state, not a startup failure. */
+export function parseTunnelInstallManifest(serialized: string): Partial<TunnelInstallManifest> | undefined {
+  try {
+    const parsed = JSON.parse(serialized) as unknown;
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? parsed as Partial<TunnelInstallManifest>
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+interface TunnelRuntimePolicyMarker {
+  version: number;
+  tunnelClientVersion: string;
+  tunnelClientBuild: string;
+  mcpConnectionMaxTtl: string;
 }
 
 function sha256(bytes: Uint8Array): string {
   return createHash("sha256").update(bytes).digest("hex");
 }
 
-function platformAsset(): string {
-  const os = process.platform === "darwin" ? "darwin"
-    : process.platform === "linux" ? "linux"
-      : process.platform === "win32" ? "windows"
-        : undefined;
-  const arch = process.arch === "arm64" ? "arm64" : process.arch === "x64" ? "amd64" : undefined;
-  if (!os || !arch) throw new Error(`openai/tunnel-client has no pinned build for ${process.platform}/${process.arch}`);
-  return `tunnel-client-v${TUNNEL_VERSION}-${os}-${arch}.zip`;
-}
-
-async function fetchBytes(url: string): Promise<Uint8Array> {
-  const response = await fetch(url, { redirect: "follow" });
-  if (!response.ok) throw new Error(`Download failed (${response.status}): ${url}`);
-  const length = Number(response.headers.get("content-length") ?? "0");
-  if (Number.isFinite(length) && length > MAX_DOWNLOAD_BYTES) throw new Error(`Download exceeds ${MAX_DOWNLOAD_BYTES} bytes: ${url}`);
-  const bytes = new Uint8Array(await response.arrayBuffer());
-  if (bytes.byteLength > MAX_DOWNLOAD_BYTES) throw new Error(`Download exceeds ${MAX_DOWNLOAD_BYTES} bytes: ${url}`);
-  return bytes;
-}
-
-function parseExpectedChecksum(text: string, asset: string): string {
-  const line = text.split(/\r?\n/).find(candidate => candidate.trim().endsWith(asset));
-  const checksum = line?.trim().split(/\s+/)[0]?.toLowerCase();
-  if (!checksum || !/^[a-f0-9]{64}$/.test(checksum)) throw new Error(`SHA256SUMS.txt has no valid entry for ${asset}`);
-  return checksum;
-}
-
 function binaryPath(): string {
-  return join(getConfigDir(), "bin", process.platform === "win32" ? "tunnel-client.exe" : "tunnel-client");
+  return join(getConfigDir(), "bin", requireTunnelClientTarget().binaryName);
 }
 
 function manifestPath(): string {
   return join(getConfigDir(), "bin", "tunnel-client-manifest.json");
 }
 
-export async function installTunnelClient(): Promise<string> {
+function runtimePolicyMarkerPath(): string {
+  return join(getConfigDir(), "bin", "tunnel-runtime-policy.json");
+}
+
+function runtimePolicyIsCurrent(): boolean {
+  const markerFile = runtimePolicyMarkerPath();
+  if (!existsSync(markerFile)) return false;
+  try {
+    const marker = JSON.parse(readFileSync(markerFile, "utf8")) as Partial<TunnelRuntimePolicyMarker>;
+    return marker.version === TUNNEL_RUNTIME_POLICY_VERSION
+      && marker.tunnelClientVersion === TUNNEL_VERSION
+      && marker.tunnelClientBuild === TUNNEL_BUILD_ID
+      && marker.mcpConnectionMaxTtl === TUNNEL_MCP_CONNECTION_MAX_TTL;
+  } catch {
+    return false;
+  }
+}
+
+function markRuntimePolicyCurrent(): void {
+  const marker: TunnelRuntimePolicyMarker = {
+    version: TUNNEL_RUNTIME_POLICY_VERSION,
+    tunnelClientVersion: TUNNEL_VERSION,
+    tunnelClientBuild: TUNNEL_BUILD_ID,
+    mcpConnectionMaxTtl: TUNNEL_MCP_CONNECTION_MAX_TTL,
+  };
+  atomicWriteFile(runtimePolicyMarkerPath(), `${JSON.stringify(marker, null, 2)}\n`);
+}
+
+export interface TunnelClientInstallOptions {
+  /**
+   * Runs after the bundled patched binary has passed checksum
+   * validation, immediately before an existing managed executable is replaced.
+   */
+  beforeReplace?: (replacementPath?: string) => void | Promise<void>;
+}
+
+function bundledTunnelClientPath(): string {
+  const target = requireTunnelClientTarget();
+  const relative = tunnelClientVendorPath(target);
+  const launcher = process.env.CODEX_CHATGPT_WEB_LAUNCHER?.trim();
+  const entrypoint = process.argv[1]?.trim();
+  const runtimeRoots = [...new Set([
+    ...(launcher ? [dirname(dirname(resolve(launcher)))] : []),
+    ...(entrypoint ? [dirname(dirname(resolve(entrypoint)))] : []),
+  ])];
+  const candidates = runtimeRoots.flatMap(runtimeRoot => [
+    join(runtimeRoot, relative),
+    join(
+      runtimeRoot,
+      "node_modules",
+      ".cache",
+      "codex-chatgpt-web",
+      "tunnel-client-no-expiry",
+      TUNNEL_BUILD_ID,
+      target.key,
+      target.binaryName,
+    ),
+  ]);
+  const bundled = candidates.find(existsSync);
+  if (!bundled) {
+    throw new Error(`Bundled no-expiry tunnel-client is missing; checked: ${candidates.join(", ")}`);
+  }
+  return bundled;
+}
+
+export async function installTunnelClient(options: TunnelClientInstallOptions = {}): Promise<string> {
+  const target = requireTunnelClientTarget();
+  const expectedHash = target.binarySha256;
   const executable = binaryPath();
   const manifestFile = manifestPath();
+  const bundled = bundledTunnelClientPath();
+  const binary = readFileSync(bundled);
+  const bundledHash = sha256(binary);
+  if (bundledHash !== expectedHash) {
+    throw new Error(`Bundled no-expiry tunnel-client failed integrity validation: ${bundled}`);
+  }
   if (existsSync(executable) && existsSync(manifestFile)) {
-    const manifest = JSON.parse(readFileSync(manifestFile, "utf8")) as Partial<TunnelInstallManifest>;
-    const actual = sha256(readFileSync(executable));
-    if (manifest.version === 1 && manifest.tunnelClientVersion === TUNNEL_VERSION) {
-      if (manifest.binarySha256 === actual) return executable;
+    const manifest = parseTunnelInstallManifest(readFileSync(manifestFile, "utf8"));
+    if (manifest?.version === 2
+      && manifest.tunnelClientVersion === TUNNEL_VERSION
+      && manifest.tunnelClientBuild === TUNNEL_BUILD_ID) {
+      const actual = sha256(readFileSync(executable));
+      if (manifest.binarySha256 === expectedHash && actual === expectedHash) return executable;
       throw new Error(`Existing tunnel-client failed integrity validation: ${executable}`);
     }
-    // A pinned version change is an ordinary managed upgrade. The replacement
-    // archive and extracted binary are both verified below before the existing
-    // executable or manifest is atomically replaced.
+    // An official or older custom build is replaced only after the bundled
+    // no-expiry payload above has passed its pinned checksum.
   }
 
-  const asset = platformAsset();
-  const [archive, sums] = await Promise.all([
-    fetchBytes(`${RELEASE_BASE}/${asset}`),
-    fetchBytes(`${RELEASE_BASE}/SHA256SUMS.txt`),
-  ]);
-  const expected = parseExpectedChecksum(new TextDecoder().decode(sums), asset);
-  const archiveHash = sha256(archive);
-  if (archiveHash !== expected) throw new Error(`Checksum mismatch for ${asset}`);
-  const files = unzipSync(archive);
-  const expectedName = process.platform === "win32" ? "tunnel-client.exe" : "tunnel-client";
-  const entry = Object.entries(files).find(([name]) => basename(name) === expectedName);
-  if (!entry) throw new Error(`${asset} does not contain ${expectedName}`);
-  const binary = entry[1];
+  await options.beforeReplace?.(executable);
   mkdirSync(dirname(executable), { recursive: true, mode: 0o700 });
   atomicWriteFile(executable, binary);
-  if (process.platform !== "win32") chmodSync(executable, 0o700);
   const manifest: TunnelInstallManifest = {
-    version: 1,
+    version: 2,
     tunnelClientVersion: TUNNEL_VERSION,
-    asset,
-    archiveSha256: archiveHash,
-    binarySha256: sha256(binary),
+    tunnelClientBuild: TUNNEL_BUILD_ID,
+    upstreamCommit: TUNNEL_UPSTREAM_COMMIT,
+    binarySha256: bundledHash,
   };
   atomicWriteFile(manifestFile, `${JSON.stringify(manifest, null, 2)}\n`);
   const version = runChecked(executable, ["--version"]);
-  if (!version.stdout.includes(TUNNEL_VERSION) && !version.stderr.includes(TUNNEL_VERSION)) {
-    throw new Error(`Installed tunnel-client did not report version ${TUNNEL_VERSION}`);
+  const reported = `${version.stdout}\n${version.stderr}`;
+  if (!reported.includes(TUNNEL_REPORTED_BUILD_MARKER)) {
+    throw new Error(`Installed tunnel-client did not report build ${TUNNEL_BUILD_ID}`);
   }
   return executable;
 }
@@ -166,6 +225,15 @@ export function mcpCommand(config: AppConfig): string {
     .join(" ");
 }
 
+export function tunnelClientEnvironment(environment: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  return {
+    ...environment,
+    // The bundled patched client treats 0s as a disabled connection timer.
+    // Omitting this value would restore upstream's 10-minute default.
+    MCP_CONNECTION_MAX_TTL: TUNNEL_MCP_CONNECTION_MAX_TTL,
+  };
+}
+
 function tunnel(config: AppConfig): TunnelConfig {
   if (config.mode !== "full" || !config.tunnel) throw new Error("Tunnel commands require full mode");
   return config.tunnel;
@@ -184,7 +252,7 @@ export function connectTunnel(config: AppConfig): void {
     "--runtime-api-key", `file:${settings.runtimeKeyFile}`,
     "--mcp-command", mcpCommand(config),
     "--json",
-  ]);
+  ], { env: tunnelClientEnvironment() });
 }
 
 export interface TunnelSession {
@@ -196,6 +264,103 @@ export interface TunnelSessionOperations {
   start: () => void | Promise<void>;
   status: () => Promise<TunnelRuntimeStatus>;
   stop: () => void | Promise<void>;
+}
+
+export interface PinnedTunnelClientOperations {
+  install: (options?: TunnelClientInstallOptions) => Promise<string>;
+  binaryExists: (path: string) => boolean;
+  stop: (config: AppConfig) => void | Promise<void>;
+  persist: (config: AppConfig) => void | Promise<void>;
+  runtimePolicyCurrent: () => boolean;
+  markRuntimePolicyCurrent: () => void | Promise<void>;
+}
+
+function sameFilesystemPath(left: string, right: string): boolean {
+  const resolvedLeft = resolve(left);
+  const resolvedRight = resolve(right);
+  return process.platform === "win32"
+    ? resolvedLeft.toLowerCase() === resolvedRight.toLowerCase()
+    : resolvedLeft === resolvedRight;
+}
+
+/**
+ * Validate (and, when needed, atomically replace) the managed tunnel client
+ * before a foreground session starts accepting tool-capable turns.
+ *
+ * v0.0.11 could close the shared stdio MCP pipe when one long connector
+ * request reached its response deadline. The replacement hook lets an old
+ * Windows runtime keep serving until the verified v0.0.12 payload is ready,
+ * then stops it before replacing the locked executable.
+ *
+ * The separate runtime-policy marker handles an already-installed v0.0.12
+ * process that was started with the official expiring build or the former 4h
+ * policy. Missing or stale policy state forces one successful stop before
+ * reusing an existing managed binary. A genuinely fresh install has no prior
+ * runtime to stop. The marker is written only after either case succeeds, so a
+ * failed migration retries on the next launch instead of silently retaining an
+ * expiring connection policy.
+ */
+export async function ensurePinnedTunnelClient(
+  config: AppConfig,
+  operations: PinnedTunnelClientOperations = {
+    install: installTunnelClient,
+    binaryExists: existsSync,
+    stop: stopTunnel,
+    persist: saveConfig,
+    runtimePolicyCurrent: runtimePolicyIsCurrent,
+    markRuntimePolicyCurrent,
+  },
+): Promise<boolean> {
+  const settings = tunnel(config);
+  let replaced = false;
+  const configuredPathBeforeInstall = settings.binaryPath;
+  const stoppedRuntimePaths: string[] = [];
+  const runtimeWasStopped = (path: string) => stoppedRuntimePaths.some(stopped => sameFilesystemPath(stopped, path));
+  const stopRuntimeAt = async (path: string) => {
+    if (runtimeWasStopped(path)) return;
+    const stopConfig = sameFilesystemPath(path, settings.binaryPath)
+      ? config
+      : {
+          ...config,
+          tunnel: { ...settings, binaryPath: path },
+        } as AppConfig;
+    await operations.stop(stopConfig);
+    stoppedRuntimePaths.push(path);
+  };
+  const policyMigrationRequired = !operations.runtimePolicyCurrent();
+  // Check before install: a fresh install creates the executable but has no
+  // old runtime whose inherited environment needs to be replaced.
+  const configuredBinaryExistedBeforeInstall = operations.binaryExists(settings.binaryPath);
+  const installedPath = await operations.install({
+    beforeReplace: async replacementPath => {
+      replaced = true;
+      const stopPath = replacementPath && operations.binaryExists(replacementPath)
+        ? replacementPath
+        : operations.binaryExists(settings.binaryPath)
+          ? settings.binaryPath
+          : undefined;
+      if (stopPath) await stopRuntimeAt(stopPath);
+    },
+  });
+  let pathMigrated = false;
+  if (!sameFilesystemPath(installedPath, settings.binaryPath)) {
+    // Older releases may have persisted a legacy managed path. Stop a runtime
+    // launched through that path before migrating the config, otherwise the
+    // new binary's StartOrReuse command could adopt the still-affected process.
+    if (operations.binaryExists(settings.binaryPath) && !runtimeWasStopped(settings.binaryPath)) {
+      await stopRuntimeAt(settings.binaryPath);
+    }
+    settings.binaryPath = installedPath;
+    await operations.persist(config);
+    pathMigrated = true;
+  }
+  if (policyMigrationRequired) {
+    if (configuredBinaryExistedBeforeInstall && !runtimeWasStopped(configuredPathBeforeInstall)) {
+      await stopRuntimeAt(configuredPathBeforeInstall);
+    }
+    await operations.markRuntimePolicyCurrent();
+  }
+  return replaced || pathMigrated || policyMigrationRequired;
 }
 
 let activeTunnelSession: TunnelSession | undefined;
@@ -253,6 +418,13 @@ export async function startTunnelSession(config: AppConfig, timeoutMs = 30_000):
   }
   tunnelSessionStarting = true;
   try {
+    const prepared = await ensurePinnedTunnelClient(config);
+    if (prepared) {
+      console.info(
+        `[tunnel] prepared managed tunnel-client ${TUNNEL_VERSION} and runtime policy `
+        + `${TUNNEL_RUNTIME_POLICY_VERSION} before session startup`,
+      );
+    }
     const owned = await negotiateTunnelSession({
       start: () => connectTunnel(config),
       status: () => waitForTunnelReady(config, timeoutMs),
@@ -379,9 +551,24 @@ export function tunnelClientVersion(): string {
   return TUNNEL_VERSION;
 }
 
+export function tunnelClientBuildId(): string {
+  return TUNNEL_BUILD_ID;
+}
+
+export function tunnelRuntimePolicyVersion(): number {
+  return TUNNEL_RUNTIME_POLICY_VERSION;
+}
+
 export function installedTunnelClientVersion(path: string): string | undefined {
   if (!existsSync(path)) return undefined;
   const result = runCommand(path, ["--version"]);
   if (result.status !== 0) return undefined;
   return /\b(\d+\.\d+\.\d+)\b/.exec(`${result.stdout}\n${result.stderr}`)?.[1];
+}
+
+export function installedTunnelClientBuildId(path: string): string | undefined {
+  if (!existsSync(path)) return undefined;
+  const result = runCommand(path, ["--version"]);
+  if (result.status !== 0) return undefined;
+  return `${result.stdout}\n${result.stderr}`.includes(TUNNEL_REPORTED_BUILD_MARKER) ? TUNNEL_BUILD_ID : undefined;
 }

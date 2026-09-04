@@ -132,7 +132,18 @@ function normalizeDeepSeekHarnessToolRequests(
       };
     }
 
-    if (tool.name === "exec_command" && typeof request.arguments.cmd === "string") {
+    const requestedShell = typeof request.arguments.shell === "string"
+      ? request.arguments.shell.trim().toLowerCase()
+      : "";
+    const powerShellTransport = !requestedShell
+      || requestedShell === "powershell"
+      || requestedShell === "powershell.exe"
+      || requestedShell === "pwsh"
+      || requestedShell === "pwsh.exe";
+
+    if (tool.name === "exec_command"
+      && powerShellTransport
+      && typeof request.arguments.cmd === "string") {
       return {
         ...request,
         arguments: {
@@ -142,7 +153,9 @@ function normalizeDeepSeekHarnessToolRequests(
       };
     }
 
-    if (tool.name === "shell_command" && typeof request.arguments.command === "string") {
+    if (tool.name === "shell_command"
+      && powerShellTransport
+      && typeof request.arguments.command === "string") {
       return {
         ...request,
         arguments: {
@@ -180,6 +193,55 @@ function normalizeDeepSeekDsmlMarkupTags(text: string): string {
       return `<${normalizedTagName}${normalizedAttributes}>`;
     },
   );
+}
+
+/**
+ * DeepSeek's renderer sometimes combines the normal Codex opening tags with
+ * its private DSML end sentinel. The sentinel is not XML and has also been
+ * observed without a final `>`, so the strict markup parser cannot see an
+ * otherwise complete request. Repair only a terminal, explicitly opened
+ * `<tool_calls>` block. Ordinary prose and examples followed by prose remain
+ * outside this compatibility path.
+ */
+function normalizeDeepSeekTerminalToolCallsMarkup(text: string): string {
+  let normalized = normalizeDeepSeekDsmlMarkupTags(normalizeDeepSeekMarkupTags(text.trim()));
+  const openings = [...normalized.matchAll(/<tool_calls>\s*/gi)];
+  if (openings.length === 0) return normalized;
+
+  const opening = openings[openings.length - 1]!;
+  const openingIndex = opening.index ?? 0;
+  const bodyStart = openingIndex + opening[0].length;
+  let body = normalized.slice(bodyStart);
+
+  if (!/<\/tool_calls>\s*$/i.test(body)) {
+    const dsmlSentinel = body.match(/<\/[^<>\r\n]*DSML[^<>\r\n]*(?:>|$)\s*$/i);
+    if (dsmlSentinel?.index !== undefined) {
+      body = `${body.slice(0, dsmlSentinel.index).trimEnd()}\n</tool_calls>`;
+    } else if (/<\/invoke>\s*$/i.test(body)) {
+      // The JSON-shaped compatibility parser already accepts a missing terminal
+      // envelope close. Apply the same tightly scoped rule to invoke markup.
+      body = `${body.trimEnd()}\n</tool_calls>`;
+    } else {
+      return normalized;
+    }
+  }
+
+  // A second renderer variant drops the final parameter close immediately
+  // before </invoke>, most often for freeform apply_patch input. Infer it only
+  // when an invoke contains exactly one parameter opening and no parameter
+  // closing; more ambiguous damage is left for the bounded correction loop.
+  body = body.replace(/<invoke\b[^>]*>[\s\S]*?<\/invoke>/gi, invoke => {
+    const parameterOpenings = [...invoke.matchAll(/<(parameter|argument|arg)\b[^>]*>/gi)];
+    const parameterClosings = [...invoke.matchAll(/<\/(parameter|argument|arg)>/gi)];
+    if (parameterOpenings.length !== 1 || parameterClosings.length !== 0) return invoke;
+    const tagName = parameterOpenings[0]![1]!.toLowerCase();
+    const closeIndex = invoke.toLowerCase().lastIndexOf("</invoke>");
+    if (closeIndex < 0) return invoke;
+    return `${invoke.slice(0, closeIndex).trimEnd()}</${tagName}>\n${invoke.slice(closeIndex)}`;
+  });
+
+  normalized = `${normalized.slice(0, bodyStart)}${body}`;
+  return normalized;
 }
 
 function normalizeDeepSeekDsmlObjectKeys(value: unknown): unknown {
@@ -640,14 +702,31 @@ function resolveDeepSeekToolRequest(
   tools: CodexTool[],
   requestedName: string,
 ): { tool: CodexTool; wireName: string } | undefined {
-  const exact = tools.find(tool => namespacedToolName(tool.namespace, tool.name) === requestedName);
+  const normalizedName = requestedName.trim().replace(/\\+_/g, "_");
+  const exact = tools.find(tool => namespacedToolName(tool.namespace, tool.name) === normalizedName);
   if (exact) return { tool: exact, wireName: namespacedToolName(exact.namespace, exact.name) };
+
+  // Models use several conventional namespace separators even when the Codex
+  // wire contract advertises `namespace__name`. Resolve only aliases that map
+  // to exactly one active tool; this never widens the advertised tool set.
+  const qualifiedMatches = tools.filter(tool => {
+    if (!tool.namespace) return false;
+    return [
+      `${tool.namespace}.${tool.name}`,
+      `${tool.namespace}/${tool.name}`,
+      `${tool.namespace}::${tool.name}`,
+    ].includes(normalizedName);
+  });
+  if (qualifiedMatches.length === 1) {
+    const tool = qualifiedMatches[0]!;
+    return { tool, wireName: namespacedToolName(tool.namespace, tool.name) };
+  }
 
   // DeepSeek sometimes drops the namespace prefix from an otherwise valid
   // advertised tool name (for example `functions__exec_command` becomes
   // `exec_command`). Accept that compatibility spelling only when the base
   // name identifies exactly one active tool. Ambiguous names remain rejected.
-  const baseMatches = tools.filter(tool => tool.name === requestedName);
+  const baseMatches = tools.filter(tool => tool.name === normalizedName);
   if (baseMatches.length !== 1) return undefined;
   const tool = baseMatches[0]!;
   return { tool, wireName: namespacedToolName(tool.namespace, tool.name) };
@@ -657,7 +736,7 @@ function parseDeepSeekMarkupToolRequests(
   text: string,
   tools: CodexTool[],
 ): DeepSeekToolRequest[] | undefined {
-  const normalized = normalizeDeepSeekMarkupTags(text.trim());
+  const normalized = normalizeDeepSeekTerminalToolCallsMarkup(text);
   // Compatibility mode accepts a terminal tool block even when DeepSeek
   // prepends ordinary assistant prose or an <aside>. The block still has to be
   // the final content in the response; embedded examples followed by prose are
@@ -723,8 +802,146 @@ function parseDeepSeekDsmlMarkupToolRequests(
   tools: CodexTool[],
 ): DeepSeekToolRequest[] | undefined {
   const normalized = normalizeDeepSeekMarkupTags(text.trim());
-  if (!/<(?!\/)[^>\r\n]*DSML[^>\r\n]*?\binvoke\b/i.test(normalized)) return undefined;
+  const hasDsmlInvoke = /<(?!\/)[^>\r\n]*DSML[^>\r\n]*?\binvoke\b/i.test(normalized);
+  const hasDsmlToolCallsEnvelope = /<(?!\/)[^>\r\n]*DSML[^>\r\n]*?\btool_calls\b/i.test(normalized);
+  const hasPlainInvoke = /<invoke\b/i.test(normalized);
+  if (!hasDsmlInvoke && !(hasDsmlToolCallsEnvelope && hasPlainInvoke)) return undefined;
   return parseDeepSeekMarkupToolRequests(normalizeDeepSeekDsmlMarkupTags(normalized), tools);
+}
+
+function parseDeepSeekNamedDsmlMarkupToolRequests(
+  text: string,
+  tools: CodexTool[],
+): DeepSeekToolRequest[] | undefined {
+  const normalized = normalizeDeepSeekMarkupTags(text.trim());
+  const tokenPattern = /<(\/?)\s*[^>\r\n]*DSML[^>\r\n]*>/gi;
+  const tokens = [...normalized.matchAll(tokenPattern)];
+  if (tokens.length === 0) return undefined;
+
+  // A newer DeepSeek renderer emits its private DSML hierarchy without the
+  // explicit `invoke` / `parameter` tag names used by older builds:
+  //   <DSML tool_calls>
+  //   <DSML name="functions__apply_patch">
+  //   <DSML name="input">*** Begin Patch ...</DSML>
+  //   </DSML>
+  //   </DSML>
+  // Treat only a terminal tool_calls hierarchy as executable. Generic DSML
+  // closing sentinels are positional, so parse them with a tiny stack instead
+  // of trying to rewrite them into XML with a regular expression.
+  const envelopeTokenIndex = tokens.findLastIndex(token => {
+    const closing = token[1] === "/";
+    return !closing && /\btool(?:\\*_)+calls\b/i.test(token[0]);
+  });
+  if (envelopeTokenIndex < 0) return undefined;
+
+  const envelopeToken = tokens[envelopeTokenIndex]!;
+  const envelopeStart = envelopeToken.index ?? 0;
+  const prefix = normalized.slice(0, envelopeStart).trim();
+  const explicitToolRequestNarration = /\b(?:let me|i(?:'|’)ll|i will|i need to)\s+(?:now\s+)?request\s+(?:it|this|that|the\s+(?:tool|call|command|patch))\b/i;
+  if (prefix && !deepSeekResponseNeedsToolRecovery(prefix) && !explicitToolRequestNarration.test(prefix)) return undefined;
+
+  const suffixTokens = tokens.slice(envelopeTokenIndex);
+  const hasNamedChild = suffixTokens.some(token => token[1] !== "/" && /\bname\s*=\s*(["'])[^"']+\1/i.test(token[0]));
+  if (!hasNamedChild) return undefined;
+
+  const isSpacing = (value: string): boolean => !value
+    .replace(/(?:&#x20;|&nbsp;|\u00a0)/gi, "")
+    .trim();
+  const tagName = (tag: string): string | undefined => {
+    const match = tag.match(/\bname\s*=\s*(["'])([^"']+)\1/i);
+    return match?.[2]?.replace(/\\+_/g, "_");
+  };
+
+  type Frame =
+    | { kind: "envelope" }
+    | { kind: "tool"; requestedName: string; tool: CodexTool; wireName: string; arguments: Record<string, unknown> }
+    | { kind: "parameter"; name: string; text: string };
+
+  const stack: Frame[] = [];
+  const requests: DeepSeekToolRequest[] = [];
+  let cursor = envelopeStart;
+  let closedEnvelope = false;
+
+  for (const token of suffixTokens) {
+    if (closedEnvelope) break;
+    const tokenIndex = token.index ?? 0;
+    const between = normalized.slice(cursor, tokenIndex);
+    const top = stack.at(-1);
+    if (top?.kind === "parameter") top.text += between;
+    else if (stack.length > 0 && !isSpacing(between)) {
+      throw new Error("DeepSeek DSML tool_calls markup contains unsupported content between tags");
+    }
+
+    const rawTag = token[0];
+    const closing = token[1] === "/";
+    cursor = tokenIndex + rawTag.length;
+
+    if (!closing) {
+      if (stack.length === 0) {
+        if (!/\btool(?:\\*_)+calls\b/i.test(rawTag)) return undefined;
+        stack.push({ kind: "envelope" });
+        continue;
+      }
+
+      const name = tagName(rawTag);
+      if (!name) {
+        throw new Error("DeepSeek DSML tool_calls markup contains an unnamed opening tag");
+      }
+      const parent = stack.at(-1)!;
+      if (parent.kind === "envelope") {
+        const resolved = resolveDeepSeekToolRequest(tools, name);
+        if (!resolved) {
+          throw new Error(`DeepSeek requested a tool that the active Codex round did not advertise: ${name}`);
+        }
+        stack.push({
+          kind: "tool",
+          requestedName: name,
+          tool: resolved.tool,
+          wireName: resolved.wireName,
+          arguments: {},
+        });
+        continue;
+      }
+      if (parent.kind === "tool") {
+        if (name in parent.arguments) {
+          throw new Error(`DeepSeek tool request ${parent.requestedName} repeated parameter ${name}`);
+        }
+        stack.push({ kind: "parameter", name, text: "" });
+        continue;
+      }
+      throw new Error("DeepSeek DSML tool request contains nested parameter markup");
+    }
+
+    const frame = stack.pop();
+    if (!frame) {
+      throw new Error("DeepSeek DSML tool_calls markup contains an unmatched closing tag");
+    }
+    if (frame.kind === "parameter") {
+      const toolFrame = stack.at(-1);
+      if (toolFrame?.kind !== "tool") {
+        throw new Error("DeepSeek DSML tool parameter closed outside a tool request");
+      }
+      toolFrame.arguments[frame.name] = markupParameterValue(toolFrame.tool, frame.name, frame.text);
+      continue;
+    }
+    if (frame.kind === "tool") {
+      requests.push({ name: frame.wireName, arguments: frame.arguments });
+      continue;
+    }
+
+    closedEnvelope = true;
+  }
+
+  if (!closedEnvelope || stack.length !== 0) {
+    throw new Error("DeepSeek emitted malformed name-only DSML tool_calls markup");
+  }
+  if (!isSpacing(normalized.slice(cursor))) {
+    throw new Error("DeepSeek DSML tool_calls markup contains unsupported trailing content");
+  }
+  if (requests.length === 0) {
+    throw new Error("DeepSeek emitted DSML tool_calls markup without any tool calls");
+  }
+  return requests;
 }
 
 export function deepSeekEffectiveTools(parsed: CodexParsedRequest): CodexTool[] {
@@ -743,6 +960,13 @@ export function deepSeekEffectiveTools(parsed: CodexParsedRequest): CodexTool[] 
   return tools;
 }
 
+export function deepSeekToolCallRequired(parsed: CodexParsedRequest): boolean {
+  const choice = parsed.options.toolChoice;
+  return choice === "required"
+    || (isAllowedToolChoice(choice) && choice.mode === "required")
+    || (typeof choice === "object" && choice !== null && "name" in choice);
+}
+
 function toolContract(tool: CodexTool): Record<string, unknown> {
   return {
     name: namespacedToolName(tool.namespace, tool.name),
@@ -757,15 +981,13 @@ export function deepSeekToolInstructions(parsed: CodexParsedRequest): string | u
   const tools = deepSeekEffectiveTools(parsed);
   if (tools.length === 0) return undefined;
 
-  const choice = parsed.options.toolChoice;
-  const required = choice === "required"
-    || (isAllowedToolChoice(choice) && choice.mode === "required")
-    || (typeof choice === "object" && choice !== null && "name" in choice);
+  const required = deepSeekToolCallRequired(parsed);
   const maxCalls = parsed.options.parallelToolCalls === false ? 1 : DEEPSEEK_MAX_PARALLEL_TOOL_CALLS;
   const contracts = JSON.stringify(tools.map(toolContract));
 
   return [
     "Codex harness tools are available indirectly for this turn. You cannot execute them inside DeepSeek Web, but you CAN request them and Codex will execute them under the user's normal harness permissions.",
+    "Tool availability never overrides safety policy, user authorization, sandboxing, or a real harness refusal. Respect those constraints and report an authoritative tool error instead of repeatedly requesting the same blocked action.",
     "For repository/file/build/debug tasks, prefer using the tools to inspect and act instead of asking the user for facts that the tools can discover.",
     "When the user asks you to change, build, fix, test, inspect, or otherwise perform work, keep working until the requested outcome is implemented and verified when practical. A plan or a list of questions is not completion.",
     "For a tool-capable coding turn, do not narrate your analysis, plan, or intended next step. Either request the needed Codex tool immediately, or give a concise final answer when no tool is needed.",
@@ -797,17 +1019,70 @@ export function deepSeekToolInstructions(parsed: CodexParsedRequest): string | u
  * surfacing it as a completed Codex turn strands the task. Keep detection tied
  * to future/planning language so ordinary explanatory prose remains valid.
  */
-export function deepSeekResponseNeedsToolRecovery(text: string): boolean {
+export type DeepSeekResponseRecoveryReason =
+  | "tool_protocol"
+  | "capability_refusal"
+  | "narration"
+  | "required_tool";
+
+function deepSeekTerminalToolIntent(text: string): boolean {
+  const normalized = normalizeDeepSeekMarkupTags(text.trim());
+  if (!normalized) return false;
+
+  const preferredJsonKey = /codex(?:\\*_)+tool(?:\\*_)+calls/i.test(normalized);
+  if (preferredJsonKey && normalized.startsWith("{")) return true;
+
+  const standardToolOpen = /<tool_calls>\s*/i.test(normalized);
+  const dsmlToolOpen = /<(?!\/)[^>\r\n]*DSML[^>\r\n]*\btool_calls/i.test(normalized);
+  const requestToolOpen = /<request_tool\b/i.test(normalized);
+  const terminalMarkup = /(?:<\/tool_calls>|<\/request_tool>|<\/invoke>|<\/[^<>\r\n]*DSML[^<>\r\n]*(?:>|$))\s*$/i
+    .test(normalized);
+  if ((standardToolOpen || dsmlToolOpen || requestToolOpen) && terminalMarkup) return true;
+
+  // A response containing only the start of an explicit tool block is also a
+  // protocol attempt, not a useful final answer. With a prose prefix, require
+  // the same short pre-action language used by narration recovery below.
+  return (standardToolOpen || dsmlToolOpen || requestToolOpen)
+    && normalized.search(/<(?:tool_calls|request_tool)\b/i) === 0;
+}
+
+export function deepSeekResponseRecoveryReason(
+  text: string,
+): DeepSeekResponseRecoveryReason | undefined {
+  if (deepSeekTerminalToolIntent(text)) return "tool_protocol";
+
   const normalized = text.replace(/\s+/g, " ").trim();
-  if (!normalized || normalized.length > 6_000) return false;
+  if (!normalized) return undefined;
 
   const tail = normalized.slice(-1_600);
-  const action = "(?:check|inspect|scan|search|look\\s+(?:at|through|for)|read|open|run|execute|test|build|create|set\\s*up|edit|modify|patch|fix|implement|write|save|generate)";
+  const head = normalized.slice(0, 1_600);
+  const capabilityWindow = normalized.length <= 4_000 ? normalized : `${head} ${tail}`;
+  const unavailableCapability = /\b(?:i|we)\s+(?:(?:do not|don't|cannot|can't)\s+(?:have\s+)?|(?:am|are|'m|'re)\s+unable\s+to\s+(?:access|use)\s+|have\s+no\s+)(?:direct\s+)?(?:access\s+to\s+)?(?:the\s+)?(?:codex\s+)?(?:tools?|filesystem|files?|workspace|repository|terminal|shell|commands?|local environment)\b/i;
+  const unableToAct = /\b(?:(?:i|we)\s+(?:cannot|can't)|(?:i(?:'|’)m|i am|we(?:'|’)re|we are)\s+unable\s+to)\s+(?:directly\s+)?(?:access|inspect|read|open|run|execute|edit|modify|patch|write|create|save)\b[^.!?]{0,120}\b(?:files?|filesystem|workspace|repository|terminal|shell|commands?|tools?|local environment)\b/i;
+  const toolsUnavailable = /^(?:i(?:'|’)m sorry[,;:]?\s+)?(?:the\s+)?(?:codex\s+)?(?:tools?|filesystem|terminal|shell)\s+(?:is|are|seem)\s+(?:not\s+available|unavailable|inaccessible)\b/i;
+  const manualDeflection = /\bplease\s+(?:run|execute|apply|make|edit)\b[^.!?]{0,100}\b(?:yourself|manually|on your (?:machine|system))\b/i;
+  const instructionsOnly = /\bi can only (?:provide|offer) (?:instructions|guidance|code)\b[^.!?]{0,100}\bnot\s+(?:run|execute|apply|make|edit|modify|perform)\b/i;
+  // Do not pressure a policy/authorization refusal or reinterpret a real tool
+  // error/quoted example as a false capability claim. Those are legitimate
+  // final states even when local tools exist.
+  const policyOrEvidence = /\b(?:safety\s+policy|policy\s+(?:does not|doesn't|prevents|prohibits)|security\s+reasons?|not\s+authori[sz]ed|without\s+authori[sz]ation|permission\s+denied|access\s+denied|command\s+failed|tool\s+result|for\s+example|quoted\s+(?:text|phrase)|the\s+(?:error|message|model|response)\s+(?:says|said|reported))\b/i;
+  if (!policyOrEvidence.test(capabilityWindow) && (unavailableCapability.test(capabilityWindow)
+    || unableToAct.test(capabilityWindow)
+    || toolsUnavailable.test(capabilityWindow)
+    || manualDeflection.test(capabilityWindow)
+    || instructionsOnly.test(capabilityWindow))) {
+    return "capability_refusal";
+  }
+
+  const action = "(?:check|inspect|scan|search|look\\s+(?:at|through|for)|read|open|run|execute|test|verify|build|create|set\\s*up|edit|modify|patch|fix|implement|write|save|generate|review|investigate|continue|clean(?:\\s+(?:it|this|that))?\\s+up|use\\s+(?:the\\s+)?(?:tool|terminal|shell|command|apply_patch))";
   const explicitFuture = new RegExp(
     `\\b(?:let me|i(?:'|’)ll|i will|i need to|i should|i(?:'|’)m going to|i am going to|we need to|we should|we(?:'|’)ll|we will)\\s+(?:now\\s+)?(?:first\\s+)?(?:continue\\s+)?${action}\\b`,
     "i",
   );
-  if (explicitFuture.test(tail)) return true;
+  if (explicitFuture.test(head) || explicitFuture.test(tail)) return "narration";
+
+  const activePresent = /\b(?:i(?:'|’)m|i am|we(?:'|’)re|we are)\s+(?:currently\s+)?(?:checking|inspecting|scanning|searching|reading|running|testing|verifying|building|editing|modifying|patching|fixing|implementing|writing|reviewing|investigating|continuing)\b/i;
+  if (activePresent.test(head) || activePresent.test(tail)) return "narration";
 
   // DeepSeek sometimes emits terse scratchpad-like planning without a subject,
   // e.g. "Need to inspect the repo first" or "First, check package.json".
@@ -817,13 +1092,29 @@ export function deepSeekResponseNeedsToolRecovery(text: string): boolean {
     `(?:^|[.!?]\\s+)(?:(?:next|first)[,;:]?\\s+(?:(?:need to|must|going to)\\s+)?|(?:need to|must|going to)\\s+)${action}\\b`,
     "i",
   );
-  return planningEdge.test(normalized.slice(0, 500)) || planningEdge.test(tail);
+  return planningEdge.test(normalized.slice(0, 500)) || planningEdge.test(tail)
+    ? "narration"
+    : undefined;
 }
 
-export function deepSeekToolRecoveryPrompt(parsed: CodexParsedRequest): string {
+export function deepSeekResponseNeedsToolRecovery(text: string): boolean {
+  return deepSeekResponseRecoveryReason(text) !== undefined;
+}
+
+export function deepSeekToolRecoveryPrompt(
+  parsed: CodexParsedRequest,
+  reason: DeepSeekResponseRecoveryReason = "narration",
+): string {
   const toolInstructions = deepSeekToolInstructions(parsed);
+  const diagnosis = reason === "tool_protocol"
+    ? "Your immediately preceding response attempted a Codex tool call, but its transport envelope was malformed or could not be validated, so Codex did not execute it."
+    : reason === "capability_refusal"
+      ? "Your immediately preceding response incorrectly claimed that local tools were unavailable. Codex has advertised indirect tools for this turn and will execute a valid request under the user's normal permissions."
+      : reason === "required_tool"
+        ? "The active Codex tool choice requires a valid tool call, but your immediately preceding response did not request one."
+        : "Your immediately preceding response was planning/progress narration instead of a Codex tool request, so Codex could not perform the work you described.";
   const blocks = [
-    "Your immediately preceding response was planning/progress narration instead of a Codex tool request, so Codex could not perform the work you described.",
+    diagnosis,
     "Continue the same task now with no analysis, plan, or preamble. Finish the actual requested work in this response instead of describing what you will do next.",
   ];
   if (toolInstructions) {
@@ -930,6 +1221,16 @@ export function parseDeepSeekToolRequests(
         }
         return normalizeDeepSeekHarnessToolRequests(dsmlMarkupRequests, tools);
       }
+      const namedDsmlMarkupRequests = parseDeepSeekNamedDsmlMarkupToolRequests(text, tools);
+      if (namedDsmlMarkupRequests) {
+        if (parsed.options.parallelToolCalls === false && namedDsmlMarkupRequests.length > 1) {
+          throw new Error("DeepSeek requested parallel tools even though this Codex turn disabled parallel tool calls");
+        }
+        if (namedDsmlMarkupRequests.length > DEEPSEEK_MAX_PARALLEL_TOOL_CALLS) {
+          throw new Error(`DeepSeek requested more than ${DEEPSEEK_MAX_PARALLEL_TOOL_CALLS} tools in one batch`);
+        }
+        return normalizeDeepSeekHarnessToolRequests(namedDsmlMarkupRequests, tools);
+      }
       const dsmlCalls = parseDeepSeekDsmlToolPayload(text);
       if (dsmlCalls) {
         payload = { [DEEPSEEK_TOOL_CALL_KEY]: dsmlCalls };
@@ -1000,4 +1301,53 @@ export function parseDeepSeekToolRequests(
     }
     return { name: resolved.wireName, arguments: argumentsValue };
   }), tools);
+}
+
+export class DeepSeekToolProtocolError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "DeepSeekToolProtocolError";
+  }
+}
+
+export interface DeepSeekToolParseOutcome {
+  requests?: DeepSeekToolRequest[];
+  protocolError?: DeepSeekToolProtocolError;
+}
+
+/**
+ * Raw DOM serialization is normally authoritative, but renderer migrations can
+ * damage it while the Markdown representation remains parseable (or vice
+ * versa). Try both unique representations before asking DeepSeek to correct a
+ * model-authored protocol error. Unexpected implementation errors still escape.
+ */
+export function parseDeepSeekToolResponseCandidates(
+  texts: readonly string[],
+  parsed: CodexParsedRequest,
+): DeepSeekToolParseOutcome {
+  const seen = new Set<string>();
+  let protocolError: DeepSeekToolProtocolError | undefined;
+
+  for (const text of texts) {
+    if (!text || seen.has(text)) continue;
+    seen.add(text);
+    try {
+      const requests = parseDeepSeekToolRequests(text, parsed);
+      if (requests) return { requests };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (!/^DeepSeek\b/.test(message)) throw error;
+      protocolError ??= new DeepSeekToolProtocolError(message, error instanceof Error ? { cause: error } : undefined);
+    }
+  }
+
+  if (!protocolError) {
+    const malformed = [...seen].some(text => deepSeekResponseRecoveryReason(text) === "tool_protocol");
+    if (malformed) {
+      protocolError = new DeepSeekToolProtocolError(
+        "DeepSeek emitted a terminal tool request whose transport envelope was malformed",
+      );
+    }
+  }
+  return { ...(protocolError ? { protocolError } : {}) };
 }

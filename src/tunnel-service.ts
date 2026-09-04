@@ -6,6 +6,8 @@ import { atomicWriteFile, getConfigDir } from "./config";
 import { runCommand, runChecked } from "./process";
 
 const LABEL = "io.github.codex-chatgpt-web.tunnel";
+/** Patched tunnel-client sentinel: zero disables the MCP connection timer. */
+export const TUNNEL_MCP_CONNECTION_MAX_TTL = "0s";
 
 export interface TunnelServiceStatus {
   supported: boolean;
@@ -69,6 +71,8 @@ ${args.map(arg => `    <string>${xml(arg)}</string>`).join("\n")}
   <dict>
     <key>CODEX_CHATGPT_WEB_HOME</key>
     <string>${xml(getConfigDir())}</string>
+    <key>MCP_CONNECTION_MAX_TTL</key>
+    <string>${TUNNEL_MCP_CONNECTION_MAX_TTL}</string>
   </dict>
   <key>RunAtLoad</key>
   <true/>

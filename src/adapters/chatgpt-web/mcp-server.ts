@@ -9,16 +9,19 @@ import { callTurnBroker, type BrokerToolResult } from "./turn-broker";
 
 interface ClaimedTurn {
   bindingId: string;
-  environment: ChatGptTurnEnvironment & { expiresAt: number };
+  environment: ChatGptTurnEnvironment;
 }
 
 interface ResolvedTurn {
-  environment: ChatGptTurnEnvironment & { expiresAt: number };
+  environment: ChatGptTurnEnvironment;
 }
 
 const bindingSchema = z.string().min(20).max(256).describe("Opaque binding_id returned by codex_bind_turn.");
 const jsonArgumentsSchema = z.record(z.string(), z.unknown()).default({});
 export const SHARED_TUNNEL_ROUTE_MISS = "CODEX_SHARED_TUNNEL_ROUTE_MISS";
+const MAX_REMEMBERED_OWNED_CAPABILITIES = 16_384;
+export const MAX_GATEWAY_INVENTORY_BINDINGS = 4_096;
+export const MAX_GATEWAY_INVENTORY_CACHE_BINDINGS = 4_096;
 
 function scopeHash(value: string): string {
   return createHash("sha256").update(value).digest("hex").slice(0, 12);
@@ -38,7 +41,7 @@ export function isPotentialNonOwnerBrokerError(error: unknown): boolean {
   // Only capability lookup misses are ambiguous under redundant tunnel
   // pollers. Broker availability/timeouts are real local failures and must not
   // be disguised as routing misses.
-  return /turn token is invalid, expired, or revoked|binding id is invalid or expired/i.test(message);
+  return /turn token is invalid(?:, expired,)? or revoked|binding id is invalid or (?:expired|revoked)/i.test(message);
 }
 
 export function shouldReroutePotentialNonOwner(error: unknown, capabilityOwnedHere: boolean): boolean {
@@ -108,10 +111,6 @@ function namedTool(environment: ChatGptTurnEnvironment, requestedWireName: strin
   return tool;
 }
 
-function invocationTimeout(environment: ChatGptTurnEnvironment & { expiresAt: number }): number {
-  return Math.max(1, environment.expiresAt - Date.now());
-}
-
 function asMcpResult(value: BrokerToolResult) {
   return {
     content: value.content as never,
@@ -160,9 +159,19 @@ export class GatewayInventoryLastKnownGood {
     tools?: GatewayNestedTool[];
   }>();
 
+  constructor(private readonly maxBindings = MAX_GATEWAY_INVENTORY_BINDINGS) {
+    if (!Number.isInteger(maxBindings) || maxBindings < 1) {
+      throw new RangeError("gateway inventory binding limit must be a positive integer");
+    }
+  }
+
   activate(bindingId: string, fingerprint: string): void {
     const current = this.byBinding.get(bindingId);
     if (current?.fingerprint === fingerprint) return;
+    if (!current && this.byBinding.size >= this.maxBindings) {
+      const oldest = this.byBinding.keys().next().value;
+      if (oldest !== undefined) this.byBinding.delete(oldest);
+    }
     this.byBinding.set(bindingId, { fingerprint });
   }
 
@@ -184,12 +193,71 @@ export class GatewayInventoryLastKnownGood {
   }
 }
 
-// The outer Codex tool registry is stable for one bound turn. A one-second
-// cache caused repeated ALL_TOOLS probes whenever the web model paused between
-// inventory and invocation, wasting both latency and web-context tokens. Keep a
-// modest cache while still fingerprinting the directly advertised tool set so
-// environment/tool changes naturally invalidate it.
-const GATEWAY_INVENTORY_CACHE_TTL_MS = 60_000;
+interface GatewayInventoryCacheEntry {
+  fingerprint: string;
+  tools: Promise<GatewayNestedTool[]>;
+}
+
+/** Count-bounded cache whose live binding capabilities never expire by age. */
+export class GatewayInventoryCache {
+  private readonly byBinding = new Map<string, GatewayInventoryCacheEntry>();
+
+  constructor(private readonly maxBindings = MAX_GATEWAY_INVENTORY_CACHE_BINDINGS) {
+    if (!Number.isInteger(maxBindings) || maxBindings < 1) {
+      throw new RangeError("gateway inventory cache limit must be a positive integer");
+    }
+  }
+
+  fresh(bindingId: string, fingerprint: string): Promise<GatewayNestedTool[]> | undefined {
+    const cached = this.byBinding.get(bindingId);
+    if (!cached) return undefined;
+    if (cached.fingerprint === fingerprint) return cached.tools;
+    // A different directly advertised registry is an explicit capability
+    // change, so discard the older scope synchronously. Elapsed time alone is
+    // never a reason to refresh or remove a live turn's tools.
+    this.byBinding.delete(bindingId);
+    return undefined;
+  }
+
+  set(bindingId: string, entry: GatewayInventoryCacheEntry): void {
+    // A refresh is a new insertion for eviction order, while the map remains
+    // bounded even if a long-lived MCP child sees many distinct turn bindings.
+    this.byBinding.delete(bindingId);
+    while (this.byBinding.size >= this.maxBindings) {
+      const oldest = this.byBinding.keys().next().value;
+      if (oldest === undefined) break;
+      this.byBinding.delete(oldest);
+    }
+    this.byBinding.set(bindingId, entry);
+  }
+
+  deleteIf(bindingId: string, tools: Promise<GatewayNestedTool[]>): void {
+    if (this.byBinding.get(bindingId)?.tools === tools) this.byBinding.delete(bindingId);
+  }
+}
+
+function waitWithAbortSignal<T>(value: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return value;
+  if (signal.aborted) return Promise.reject(new DOMException("Codex MCP request aborted", "AbortError"));
+  return new Promise<T>((resolveWait, rejectWait) => {
+    const cleanup = () => signal.removeEventListener("abort", onAbort);
+    const onAbort = () => {
+      cleanup();
+      rejectWait(new DOMException("Codex MCP request aborted", "AbortError"));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    value.then(
+      resultValue => {
+        cleanup();
+        resolveWait(resultValue);
+      },
+      error => {
+        cleanup();
+        rejectWait(error);
+      },
+    );
+  });
+}
 
 export function shellCommandInvocationArgs(options: {
   cmd: string;
@@ -459,38 +527,27 @@ export async function runChatGptMcpServer(options: { brokerSocketPath: string })
   // A connector/session id is broader than one Codex turn. In redundant
   // same-tunnel deployments the same ChatGPT session can legitimately dispatch
   // consecutive turns to different machines, so remembering ownership by MCP
-  // session scope causes false "local expiry" classifications on non-owners.
+  // session scope causes false local-ownership classifications on non-owners.
   // Track only capabilities this exact broker process has successfully claimed.
   // Hashes avoid retaining bearer capability values in the MCP child longer than
   // the broker needs them.
-  const ownedTurnTokens = new Map<string, number>();
-  const ownedBindingIds = new Map<string, number>();
-  const gatewayInventoryCache = new Map<string, {
-    fingerprint: string;
-    createdAt: number;
-    tools: Promise<GatewayNestedTool[]>;
-  }>();
+  const ownedTurnTokens = new Set<string>();
+  const ownedBindingIds = new Set<string>();
+  const gatewayInventoryCache = new GatewayInventoryCache();
   const gatewayInventoryLastKnownGood = new GatewayInventoryLastKnownGood();
 
   const capabilityKey = (value: string) => createHash("sha256").update(value).digest("hex");
 
-  const pruneOwnedCapabilities = () => {
-    const now = Date.now();
-    for (const [key, expiresAt] of ownedTurnTokens) {
-      if (expiresAt <= now) ownedTurnTokens.delete(key);
-    }
-    for (const [key, expiresAt] of ownedBindingIds) {
-      if (expiresAt <= now) ownedBindingIds.delete(key);
-    }
+  const rememberOwnedCapability = (store: Set<string>, value: string) => {
+    const key = capabilityKey(value);
+    if (store.has(key)) return;
+    store.add(key);
+    if (store.size <= MAX_REMEMBERED_OWNED_CAPABILITIES) return;
+    const oldest = store.values().next().value;
+    if (oldest) store.delete(oldest);
   };
 
-  const rememberOwnedCapability = (store: Map<string, number>, value: string, expiresAt: number) => {
-    pruneOwnedCapabilities();
-    store.set(capabilityKey(value), expiresAt);
-  };
-
-  const ownsCapability = (store: Map<string, number>, value: string): boolean => {
-    pruneOwnedCapabilities();
+  const ownsCapability = (store: Set<string>, value: string): boolean => {
     return store.has(capabilityKey(value));
   };
 
@@ -514,41 +571,48 @@ export async function runChatGptMcpServer(options: { brokerSocketPath: string })
   const environment = async (
     bindingId: string,
     extra: { signal?: AbortSignal; sessionId?: string; _meta?: unknown },
-  ): Promise<ChatGptTurnEnvironment & { expiresAt: number }> => {
+  ): Promise<ChatGptTurnEnvironment> => {
     let resolved: ResolvedTurn;
     try {
-      resolved = await callTurnBroker<ResolvedTurn>(options.brokerSocketPath, { method: "resolve", bindingId });
+      resolved = await callTurnBroker<ResolvedTurn>(
+        options.brokerSocketPath,
+        { method: "resolve", bindingId },
+        5_000,
+        extra.signal,
+      );
     } catch (error) {
       throw reroutePotentialNonOwner(error, extra, ownsCapability(ownedBindingIds, bindingId));
     }
-    if (resolved.environment.expiresAt <= Date.now()) throw new Error("Codex turn binding expired");
-    rememberOwnedCapability(ownedBindingIds, bindingId, resolved.environment.expiresAt);
+    rememberOwnedCapability(ownedBindingIds, bindingId);
     return resolved.environment;
   };
 
   const invokeRaw = async (
     bindingId: string,
-    bound: ChatGptTurnEnvironment & { expiresAt: number },
+    bound: ChatGptTurnEnvironment,
     tool: CodexTool,
     payload: { arguments?: Record<string, unknown>; input?: string },
+    signal?: AbortSignal,
   ): Promise<BrokerToolResult> => callTurnBroker<BrokerToolResult>(options.brokerSocketPath, {
       method: "invoke",
       bindingId,
       wireName: wireName(tool),
       freeform: tool.freeform === true,
       ...(tool.freeform ? { input: payload.input ?? "" } : { arguments: payload.arguments ?? {} }),
-    }, invocationTimeout(bound));
+    }, 0, signal);
 
   const invoke = async (
     bindingId: string,
-    bound: ChatGptTurnEnvironment & { expiresAt: number },
+    bound: ChatGptTurnEnvironment,
     tool: CodexTool,
     payload: { arguments?: Record<string, unknown>; input?: string },
-  ) => asMcpResult(await invokeRaw(bindingId, bound, tool, payload));
+    signal?: AbortSignal,
+  ) => asMcpResult(await invokeRaw(bindingId, bound, tool, payload, signal));
 
   const discoverGatewayTools = (
     bindingId: string,
-    bound: ChatGptTurnEnvironment & { expiresAt: number },
+    bound: ChatGptTurnEnvironment,
+    signal?: AbortSignal,
   ): Promise<GatewayNestedTool[]> => {
     const fingerprint = createHash("sha256").update(JSON.stringify(bound.tools.map(tool => ({
       wireName: wireName(tool),
@@ -558,10 +622,8 @@ export async function runChatGptMcpServer(options: { brokerSocketPath: string })
       toolSearch: tool.toolSearch === true,
     })))).digest("hex");
     gatewayInventoryLastKnownGood.activate(bindingId, fingerprint);
-    const cached = gatewayInventoryCache.get(bindingId);
-    if (cached
-      && cached.fingerprint === fingerprint
-      && Date.now() - cached.createdAt < GATEWAY_INVENTORY_CACHE_TTL_MS) return cached.tools;
+    const cached = gatewayInventoryCache.fresh(bindingId, fingerprint);
+    if (cached) return waitWithAbortSignal(cached, signal);
     const pending = (async () => {
       const fallback = gatewayNestedTools(bound);
       const gateway = execGateway(bound);
@@ -571,7 +633,7 @@ export async function runChatGptMcpServer(options: { brokerSocketPath: string })
       try {
         const response = await invokeRaw(bindingId, bound, gateway, {
           input: "text(ALL_TOOLS.map(tool => ({ name: tool.name, description: tool.description })));",
-        });
+        }, signal);
         const textBlock = response.content.find((item): item is { type: string; text: string } => (
           Boolean(item) && typeof item === "object" && !Array.isArray(item)
           && (item as Record<string, unknown>).type === "text"
@@ -597,28 +659,31 @@ export async function runChatGptMcpServer(options: { brokerSocketPath: string })
             : tool);
         }
         return gatewayInventoryLastKnownGood.preserve(bindingId, fingerprint, [...merged.values()], fallback);
-      } catch {
+      } catch (error) {
+        if (signal?.aborted) throw error;
         return gatewayInventoryLastKnownGood.preserve(bindingId, fingerprint, [], fallback);
       }
     })();
-    gatewayInventoryCache.set(bindingId, { fingerprint, createdAt: Date.now(), tools: pending });
-    return pending;
+    gatewayInventoryCache.set(bindingId, { fingerprint, tools: pending });
+    void pending.catch(() => gatewayInventoryCache.deleteIf(bindingId, pending));
+    return waitWithAbortSignal(pending, signal);
   };
 
   const invokeNative = (
     bindingId: string,
-    bound: ChatGptTurnEnvironment & { expiresAt: number },
+    bound: ChatGptTurnEnvironment,
     tool: CodexTool,
     payload: { arguments?: Record<string, unknown>; input?: string },
-  ) => invoke(bindingId, bound, tool, payload);
+    signal?: AbortSignal,
+  ) => invoke(bindingId, bound, tool, payload, signal);
 
   const invokeNestedNative = (
     bindingId: string,
-    bound: ChatGptTurnEnvironment & { expiresAt: number },
+    bound: ChatGptTurnEnvironment,
     nestedToolName: string,
     freeform: boolean,
     payload: { arguments?: Record<string, unknown>; input?: string },
-    options: { yieldTimeMs?: number; maxOutputTokens?: number } = {},
+    options: { yieldTimeMs?: number; maxOutputTokens?: number; signal?: AbortSignal } = {},
   ) => {
     const gateway = execGateway(bound);
     if (!gateway) {
@@ -626,7 +691,7 @@ export async function runChatGptMcpServer(options: { brokerSocketPath: string })
     }
     return invoke(bindingId, bound, gateway, {
       input: execGatewayProgram(nestedToolName, freeform, payload, options),
-    });
+    }, options.signal);
   };
 
   server.registerTool(
@@ -641,12 +706,17 @@ export async function runChatGptMcpServer(options: { brokerSocketPath: string })
       console.error(`[chatgpt-web-mcp] codex_bind_turn scope=${requestScopeSummary(extra)}`);
       let claimed: ClaimedTurn;
       try {
-        claimed = await callTurnBroker<ClaimedTurn>(options.brokerSocketPath, { method: "claim", token: turn_token });
+        claimed = await callTurnBroker<ClaimedTurn>(
+          options.brokerSocketPath,
+          { method: "claim", token: turn_token },
+          5_000,
+          extra.signal,
+        );
       } catch (error) {
         throw reroutePotentialNonOwner(error, extra, ownsCapability(ownedTurnTokens, turn_token));
       }
-      rememberOwnedCapability(ownedTurnTokens, turn_token, claimed.environment.expiresAt);
-      rememberOwnedCapability(ownedBindingIds, claimed.bindingId, claimed.environment.expiresAt);
+      rememberOwnedCapability(ownedTurnTokens, turn_token);
+      rememberOwnedCapability(ownedBindingIds, claimed.bindingId);
       const commandTool = nativeFunctionTool(claimed.environment, "exec_command") ?? nativeFunctionTool(claimed.environment, "shell_command");
       const gateway = execGateway(claimed.environment);
       // Keep binding a pure ownership/capability handshake. Live ALL_TOOLS
@@ -688,7 +758,6 @@ export async function runChatGptMcpServer(options: { brokerSocketPath: string })
         roots: claimed.environment.roots,
         writable_roots: claimed.environment.writableRoots,
         sandbox: claimed.environment.sandboxPolicy.type,
-        expires_at: new Date(claimed.environment.expiresAt).toISOString(),
         tool_count: directToolNames.size + nestedToolNames.size,
         direct_tool_count: directToolNames.size,
         nested_tool_count: nestedToolNames.size,
@@ -742,7 +811,7 @@ export async function runChatGptMcpServer(options: { brokerSocketPath: string })
               ...(yield_time_ms !== undefined ? { yieldTimeMs: yield_time_ms } : {}),
               ...(timeout_ms !== undefined ? { timeoutMs: timeout_ms } : {}),
             });
-        return withYieldedSessionId(await invokeNative(binding_id, bound, tool, { arguments: args }));
+        return withYieldedSessionId(await invokeNative(binding_id, bound, tool, { arguments: args }, extra.signal));
       }
 
       const gateway = execGateway(bound);
@@ -759,7 +828,7 @@ export async function runChatGptMcpServer(options: { brokerSocketPath: string })
           ...(max_output_tokens !== undefined ? { maxOutputTokens: max_output_tokens } : {}),
           ...(tty !== undefined ? { tty } : {}),
         }),
-      });
+      }, extra.signal);
       return withYieldedSessionId(await response);
     },
   );
@@ -787,7 +856,9 @@ export async function runChatGptMcpServer(options: { brokerSocketPath: string })
       const declaredContinuation = tool || directWait
         ? undefined
         : resolveSessionContinuationToolNameFromInventory(bound, declared);
-      const discovered = tool || directWait || declaredContinuation ? declared : await discoverGatewayTools(binding_id, bound);
+      const discovered = tool || directWait || declaredContinuation
+        ? declared
+        : await discoverGatewayTools(binding_id, bound, extra.signal);
       const nestedWrite = discovered.find(candidate => candidate.wireName === "write_stdin");
       const nestedWait = nestedWrite ? undefined : discovered.find(candidate => candidate.wireName === "wait");
       if (!tool && !directWait && !nestedWrite && !nestedWait) {
@@ -808,8 +879,8 @@ export async function runChatGptMcpServer(options: { brokerSocketPath: string })
           ...(terminate !== undefined ? { terminate } : {}),
         }) };
         const response = directWait
-          ? invokeNative(binding_id, bound, directWait, waitPayload)
-          : invokeNestedNative(binding_id, bound, "wait", false, waitPayload);
+          ? invokeNative(binding_id, bound, directWait, waitPayload, extra.signal)
+          : invokeNestedNative(binding_id, bound, "wait", false, waitPayload, { signal: extra.signal });
         return withYieldedSessionId(await response);
       }
       if (terminate) {
@@ -822,8 +893,8 @@ export async function runChatGptMcpServer(options: { brokerSocketPath: string })
         ...(max_output_tokens !== undefined ? { max_output_tokens } : {}),
       } };
       return tool
-        ? invokeNative(binding_id, bound, tool, payload)
-        : invokeNestedNative(binding_id, bound, "write_stdin", false, payload);
+        ? invokeNative(binding_id, bound, tool, payload, extra.signal)
+        : invokeNestedNative(binding_id, bound, "write_stdin", false, payload, { signal: extra.signal });
     },
   );
 
@@ -838,10 +909,12 @@ export async function runChatGptMcpServer(options: { brokerSocketPath: string })
     async ({ binding_id, patch }, extra) => {
       const bound = await environment(binding_id, extra);
       const tool = exactTool(bound, "apply_patch");
-      if (!tool) return invokeNestedNative(binding_id, bound, "apply_patch", true, { input: patch });
+      if (!tool) {
+        return invokeNestedNative(binding_id, bound, "apply_patch", true, { input: patch }, { signal: extra.signal });
+      }
       return tool.freeform
-        ? invokeNative(binding_id, bound, tool, { input: patch })
-        : invokeNative(binding_id, bound, tool, { arguments: { input: patch } });
+        ? invokeNative(binding_id, bound, tool, { input: patch }, extra.signal)
+        : invokeNative(binding_id, bound, tool, { arguments: { input: patch } }, extra.signal);
     },
   );
 
@@ -862,8 +935,8 @@ export async function runChatGptMcpServer(options: { brokerSocketPath: string })
       const tool = nativeFunctionTool(bound, "view_image");
       const payload = { arguments: { path, ...(detail ? { detail } : {}) } };
       return tool
-        ? invokeNative(binding_id, bound, tool, payload)
-        : invokeNestedNative(binding_id, bound, "view_image", false, payload);
+        ? invokeNative(binding_id, bound, tool, payload, extra.signal)
+        : invokeNestedNative(binding_id, bound, "view_image", false, payload, { signal: extra.signal });
     },
   );
 
@@ -923,7 +996,7 @@ export async function runChatGptMcpServer(options: { brokerSocketPath: string })
           next_offset: offset + page.length < exactKnown.length ? offset + page.length : null,
         });
       }
-      const nested = mapNested(await discoverGatewayTools(binding_id, bound));
+      const nested = mapNested(await discoverGatewayTools(binding_id, bound, extra.signal));
       const matches = [...direct, ...nested].filter(tool => !needle || [
         tool.wire_name,
         tool.name,
@@ -980,26 +1053,29 @@ export async function runChatGptMcpServer(options: { brokerSocketPath: string })
       const declaredNested = tool ? undefined : gatewayNestedTool(bound, wire_name);
       const nested = tool
         ? undefined
-        : declaredNested ?? (await discoverGatewayTools(binding_id, bound)).find(candidate => candidate.wireName === wire_name);
+        : declaredNested
+          ?? (await discoverGatewayTools(binding_id, bound, extra.signal)).find(candidate => candidate.wireName === wire_name);
       if (!tool && !nested) throw new Error(`Codex tool is not available in this turn: ${wire_name}`);
       const freeform = tool?.freeform === true || nested?.freeform === true;
       if (freeform) {
         if (input === undefined) throw new Error(`Freeform Codex tool ${wire_name} requires input`);
         if (args && Object.keys(args).length > 0) throw new Error(`Freeform Codex tool ${wire_name} does not accept arguments`);
         const response = tool
-          ? invokeNative(binding_id, bound, tool, { input })
+          ? invokeNative(binding_id, bound, tool, { input }, extra.signal)
           : invokeNestedNative(binding_id, bound, wire_name, true, { input }, {
               ...(yield_time_ms !== undefined ? { yieldTimeMs: yield_time_ms } : {}),
               ...(max_output_tokens !== undefined ? { maxOutputTokens: max_output_tokens } : {}),
+              signal: extra.signal,
             });
         return withYieldedSessionId(await response);
       }
       if (input !== undefined) throw new Error(`Function Codex tool ${wire_name} does not accept freeform input`);
       const response = tool
-        ? invokeNative(binding_id, bound, tool, { arguments: args ?? {} })
+        ? invokeNative(binding_id, bound, tool, { arguments: args ?? {} }, extra.signal)
         : invokeNestedNative(binding_id, bound, wire_name, false, { arguments: args ?? {} }, {
             ...(yield_time_ms !== undefined ? { yieldTimeMs: yield_time_ms } : {}),
             ...(max_output_tokens !== undefined ? { maxOutputTokens: max_output_tokens } : {}),
+            signal: extra.signal,
           });
       return withYieldedSessionId(await response);
     },

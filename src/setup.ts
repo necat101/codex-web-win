@@ -1,6 +1,7 @@
 import { existsSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { createServer } from "node:net";
+import { resolve } from "node:path";
 import type { AppConfig, RuntimeMode } from "./config";
 import {
   currentRuntimeCommand,
@@ -211,10 +212,26 @@ function baseConfig(existing: AppConfig | undefined, options: SetupOptions): App
   return config;
 }
 
-async function configureTunnel(config: AppConfig, existing: AppConfig | undefined, options: SetupOptions): Promise<void> {
+interface TunnelSetupResult {
+  stoppedReplacementPath?: string;
+}
+
+function sameTunnelExecutablePath(left: string, right: string): boolean {
+  const resolvedLeft = resolve(left);
+  const resolvedRight = resolve(right);
+  return process.platform === "win32"
+    ? resolvedLeft.toLowerCase() === resolvedRight.toLowerCase()
+    : resolvedLeft === resolvedRight;
+}
+
+async function configureTunnel(
+  config: AppConfig,
+  existing: AppConfig | undefined,
+  options: SetupOptions,
+): Promise<TunnelSetupResult> {
   if (config.mode === "browser-only") {
     delete config.tunnel;
-    return;
+    return {};
   }
   const existingTunnel = existing?.mode === "full" ? existing.tunnel : undefined;
   const tunnelId = options.tunnelId ?? existingTunnel?.tunnelId;
@@ -228,14 +245,50 @@ async function configureTunnel(config: AppConfig, existing: AppConfig | undefine
   if (!runtimeKeyFile || !existsSync(runtimeKeyFile)) {
     throw new Error("Full mode requires a runtime key. Import it interactively or pass --runtime-key-file; create it at https://platform.openai.com/settings/organization/api-keys");
   }
-  const installedBinary = await installTunnelClient();
-  config.tunnel = createTunnelConfig({
-    binaryPath: installedBinary,
+  const tunnelOptions = {
     tunnelId,
     runtimeKeyFile,
     profileName: existingTunnel?.profileName,
     alias: existingTunnel?.alias,
+  };
+  let stoppedReplacementPath: string | undefined;
+  let replacementAttempted = false;
+  const stopManagedRuntimeAt = (path: string) => {
+    if (stoppedReplacementPath && sameTunnelExecutablePath(stoppedReplacementPath, path)) return;
+    const replacementConfig: AppConfig = {
+      ...config,
+      mode: "full",
+      tunnel: createTunnelConfig({ binaryPath: path, ...tunnelOptions }),
+    };
+    stopTunnel(replacementConfig);
+    stoppedReplacementPath = path;
+  };
+  const installedBinary = await installTunnelClient({
+    beforeReplace: replacementPath => {
+      replacementAttempted = true;
+      if (!replacementPath || !existsSync(replacementPath)) return;
+      // installTunnelClient invokes this hook only after authenticating the
+      // bundled payload and immediately before replacing the managed file. Use
+      // the actual replacement path rather than a possibly stale saved path so
+      // Windows releases the executable lock before the atomic write.
+      stopManagedRuntimeAt(replacementPath);
+    },
   });
+  if (existingTunnel
+    && !replacementAttempted
+    && existsSync(installedBinary)
+    && !sameTunnelExecutablePath(installedBinary, existingTunnel.binaryPath)) {
+    // A valid managed binary can be reused without invoking beforeReplace. If
+    // stale configuration still points elsewhere, retire a possible orphan at
+    // the path setup is about to adopt before separately retiring the stale
+    // configured runtime below.
+    stopManagedRuntimeAt(installedBinary);
+  }
+  config.tunnel = createTunnelConfig({
+    binaryPath: installedBinary,
+    ...tunnelOptions,
+  });
+  return { ...(stoppedReplacementPath ? { stoppedReplacementPath } : {}) };
 }
 
 export async function setup(options: SetupOptions): Promise<SetupResult> {
@@ -291,7 +344,7 @@ export async function setup(options: SetupOptions): Promise<SetupResult> {
     );
   }
   if (beforeService.loaded && preliminaryChange && existing) await assertServiceIdle(existing);
-  await configureTunnel(config, existing, options);
+  const tunnelSetup = await configureTunnel(config, existing, options);
 
   const changedWhileLoaded = Boolean(existing && beforeService.loaded && meaningfulRuntimeChange(existing, config));
   if (changedWhileLoaded && !options.restartService) {
@@ -302,11 +355,14 @@ export async function setup(options: SetupOptions): Promise<SetupResult> {
   }
   if (changedWhileLoaded && !preliminaryChange && existing) await assertServiceIdle(existing);
   if (!beforeService.loaded) await assertPortAvailable(config.host, config.port);
-  let previousTunnelStopped = false;
+  let previousTunnelStopped = Boolean(tunnelSetup.stoppedReplacementPath);
   if (!managedServices && existing?.mode === "full" && existsSync(existing.tunnel!.binaryPath)) {
     // A prior Windows launcher may have been interrupted before its graceful
     // cleanup ran. Setup never adopts that runtime and never leaves it behind.
-    stopTunnel(existing);
+    if (!tunnelSetup.stoppedReplacementPath
+      || !sameTunnelExecutablePath(tunnelSetup.stoppedReplacementPath, existing.tunnel!.binaryPath)) {
+      stopTunnel(existing);
+    }
     previousTunnelStopped = true;
   }
   saveConfig(config);

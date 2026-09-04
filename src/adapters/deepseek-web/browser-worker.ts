@@ -31,10 +31,12 @@ export const DEEPSEEK_COMPLETION_FALLBACK_STABLE_MS = 2_500;
 export const DEEPSEEK_MAX_COMPLETION_OBSERVATION_GAP_MS = 3_500;
 export const DEEPSEEK_RESPONSE_DOM_GRACE_MS = 60_000;
 export const DEEPSEEK_RUNNING_WITHOUT_RESPONSE_GRACE_MS = 10 * 60_000;
+export const DEEPSEEK_UNCHANGED_RUNNING_RESPONSE_GRACE_MS = 10 * 60_000;
 export const DEEPSEEK_EMPTY_RESPONSE_GRACE_MS = 15_000;
 export const DEEPSEEK_DOM_PROBE_GRACE_MS = 60_000;
 export const DEEPSEEK_WATCHDOG_OBSERVATION_GAP_MS = 10_000;
 export const DEEPSEEK_REPLAY_TTL_MS = 10 * 60_000;
+export const DEEPSEEK_MAX_RETRY_CLICKS = 3;
 
 export interface DeepSeekBrowserTurn {
   traceId: string;
@@ -77,6 +79,9 @@ export interface DeepSeekResponseSnapshot {
    * elements instead of displaying the markup literally.
    */
   finalRawText?: string;
+  /** DOM position of the latest assistant response, used to distinguish a new
+   * continuation bubble even when DeepSeek repeats byte-identical text. */
+  responseIdentity?: string;
   finalTextLength: number;
   activitySignature: string;
   blockedText?: string;
@@ -93,7 +98,8 @@ export function deepSeekContinuationResponseChanged(
   current: DeepSeekResponseSnapshot,
 ): boolean {
   return current.responsePresent && (
-    current.finalHtml !== baseline.finalHtml
+    current.responseIdentity !== baseline.responseIdentity
+    || current.finalHtml !== baseline.finalHtml
     || current.finalText !== baseline.finalText
     || current.finalRawText !== baseline.finalRawText
   );
@@ -158,10 +164,41 @@ export class DeepSeekCompletionTracker {
   }
 }
 
+/**
+ * Bound DeepSeek's in-page busy recovery without ever resubmitting the user's
+ * prompt. A click is consumed only after the visible Retry control accepted a
+ * click; once exhausted, the browser turn fails through the normal post-submit
+ * non-retryable path instead of clicking forever.
+ */
+export class DeepSeekRetryClickBudget {
+  private clicks = 0;
+
+  constructor(readonly limit = DEEPSEEK_MAX_RETRY_CLICKS) {
+    if (!Number.isInteger(limit) || limit < 1) {
+      throw new RangeError("DeepSeek Retry click limit must be a positive integer");
+    }
+  }
+
+  get used(): number {
+    return this.clicks;
+  }
+
+  get exhausted(): boolean {
+    return this.clicks >= this.limit;
+  }
+
+  recordClick(): number {
+    if (this.exhausted) throw new Error("DeepSeek Retry click budget is exhausted");
+    this.clicks += 1;
+    return this.clicks;
+  }
+}
+
 export class DeepSeekTurnDomHealthTracker {
   private sawResponse = false;
   private missingResponseSince?: number;
   private runningWithoutResponseSince?: number;
+  private runningResponseCandidate?: { text: string; rawText: string; since: number };
   private emptyCompletionSince?: number;
   private probeFailureSince?: number;
   private lastObservedAt?: number;
@@ -172,6 +209,7 @@ export class DeepSeekTurnDomHealthTracker {
     private readonly probeFailureMs = DEEPSEEK_DOM_PROBE_GRACE_MS,
     private readonly maxObservationGapMs = DEEPSEEK_WATCHDOG_OBSERVATION_GAP_MS,
     private readonly runningWithoutResponseMs = DEEPSEEK_RUNNING_WITHOUT_RESPONSE_GRACE_MS,
+    private readonly unchangedRunningResponseMs = DEEPSEEK_UNCHANGED_RUNNING_RESPONSE_GRACE_MS,
   ) {}
 
   update(state: DeepSeekResponseSnapshot, now = Date.now()): string | undefined {
@@ -179,6 +217,7 @@ export class DeepSeekTurnDomHealthTracker {
       && (now < this.lastObservedAt || now - this.lastObservedAt >= this.maxObservationGapMs)) {
       this.missingResponseSince = undefined;
       this.runningWithoutResponseSince = undefined;
+      this.runningResponseCandidate = undefined;
       this.emptyCompletionSince = undefined;
       this.probeFailureSince = undefined;
     }
@@ -211,6 +250,21 @@ export class DeepSeekTurnDomHealthTracker {
           ? "DeepSeek Web response DOM disappeared while the browser turn was active"
           : "DeepSeek Web did not create a response DOM after the message was sent";
       }
+    }
+
+    if (state.responsePresent && state.running) {
+      // Track literal assistant output rather than the broader DOM activity
+      // signature. Spinner/control churn is not semantic progress and must not
+      // keep a frozen partial response alive indefinitely.
+      const rawText = state.finalRawText ?? "";
+      if (this.runningResponseCandidate?.text !== state.finalText
+        || this.runningResponseCandidate.rawText !== rawText) {
+        this.runningResponseCandidate = { text: state.finalText, rawText, since: now };
+      } else if (now - this.runningResponseCandidate.since >= this.unchangedRunningResponseMs) {
+        return "DeepSeek Web remained active with an unchanged partial response beyond the recovery window";
+      }
+    } else {
+      this.runningResponseCandidate = undefined;
     }
 
     const emptyCompletion = state.responsePresent
@@ -713,6 +767,14 @@ export class DeepSeekBrowserWorker {
           .map(serializeRawResponse)
           .join("\n")
           .trim();
+        const rootMessageIndex = root ? messages.indexOf(root) : -1;
+        const fallbackNode = root ? undefined : markdownNodes.at(-1);
+        const fallbackResponseIndex = fallbackNode
+          ? [...document.querySelectorAll<HTMLElement>(responseSelector)].indexOf(fallbackNode)
+          : -1;
+        const responseIdentity = root
+          ? `message:${rootMessageIndex}:assistant:${responseRoots.length}`
+          : fallbackNode ? `markdown:${fallbackResponseIndex}` : "";
         // DeepSeek may visually hide Copy/Regenerate controls until the answer
         // is hovered. They remain semantically attached to the response root,
         // so visibility is not required for this completion signal.
@@ -728,6 +790,9 @@ export class DeepSeekBrowserWorker {
         let completionActionPresent = false;
         let controlScope: HTMLElement | null | undefined = responseAnchor;
         for (let depth = 0; controlScope && depth < 6 && controlScope !== document.body; depth++, controlScope = controlScope.parentElement) {
+          // Do not climb into a shared chat container where controls from an old
+          // response could be mistaken for completion actions on the latest one.
+          if (controlScope.querySelectorAll(".ds-message").length > 1) break;
           const responseControls = [...controlScope.querySelectorAll<HTMLElement>(
             'button, [role="button"], [aria-label], [title], [data-testid]',
           )];
@@ -770,6 +835,7 @@ export class DeepSeekBrowserWorker {
           finalHtml,
           finalText,
           finalRawText,
+          responseIdentity,
           finalTextLength: Math.max(finalText.length, finalRawText.length),
           activitySignature,
         } satisfies DeepSeekResponseSnapshot;
@@ -909,6 +975,7 @@ export class DeepSeekBrowserWorker {
       );
       const completion = new DeepSeekCompletionTracker();
       const domHealth = new DeepSeekTurnDomHealthTracker();
+      const retryBudget = new DeepSeekRetryClickBudget();
       let lastActivitySignature = "";
       let inactivityDeadline = Date.now() + this.config.turnTimeoutMs;
       let lastHeartbeat = 0;
@@ -930,12 +997,22 @@ export class DeepSeekBrowserWorker {
         }
         if (snapshot.retryActionPresent) {
           completion.reset();
-          if (now >= nextRetryAt && await this.clickRetryAction(page)) {
-            nextRetryAt = now + DEEPSEEK_RETRY_COOLDOWN_MS;
-            inactivityDeadline = now + this.config.turnTimeoutMs;
-            console.info(`[deepseek-web] browser turn ${turn.traceId} clicked DeepSeek Retry after busy response`);
-            await page.waitForTimeout(DEEPSEEK_RESPONSE_POLL_MS);
-            continue;
+          if (now >= nextRetryAt) {
+            if (retryBudget.exhausted) {
+              throw new Error(
+                `DeepSeek Web remained busy after ${retryBudget.limit} Retry attempts`,
+              );
+            }
+            if (await this.clickRetryAction(page)) {
+              const retryAttempt = retryBudget.recordClick();
+              nextRetryAt = now + DEEPSEEK_RETRY_COOLDOWN_MS;
+              inactivityDeadline = now + this.config.turnTimeoutMs;
+              console.info(
+                `[deepseek-web] browser turn ${turn.traceId} clicked DeepSeek Retry after busy response attempt=${retryAttempt}/${retryBudget.limit}`,
+              );
+              await page.waitForTimeout(DEEPSEEK_RESPONSE_POLL_MS);
+              continue;
+            }
           }
         }
         const domFailure = domHealth.update(snapshot, now);

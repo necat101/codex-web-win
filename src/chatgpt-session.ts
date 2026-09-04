@@ -2,6 +2,25 @@ import type { Locator, Page } from "playwright-core";
 
 export const CHATGPT_TEMPORARY_CHAT_URL = "https://chatgpt.com/?temporary-chat=true&surface=chat";
 
+export const GOOGLE_SECURE_BROWSER_RELOGIN_MESSAGE =
+  "Google sign-in cannot be completed inside the automation-controlled browser. "
+  + "Run `codex-chatgpt-web login`, finish Google/ChatGPT sign-in in the normal Chrome window it opens, "
+  + "wait until the ChatGPT composer is visible, then close that dedicated Chrome window.";
+
+export function isGoogleAccountSignInUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:" && url.hostname.toLowerCase() === "accounts.google.com";
+  } catch {
+    return false;
+  }
+}
+
+export function chatGptReauthenticationMessage(currentUrl: string): string {
+  if (isGoogleAccountSignInUrl(currentUrl)) return GOOGLE_SECURE_BROWSER_RELOGIN_MESSAGE;
+  return "ChatGPT web login is expired. Run `codex-chatgpt-web login` to refresh it in a normal Chrome window.";
+}
+
 async function anyVisible(locator: Locator): Promise<boolean> {
   return locator.evaluateAll(elements => elements.some(element => {
     const candidate = element as HTMLElement;
@@ -23,9 +42,12 @@ async function anyVisible(locator: Locator): Promise<boolean> {
 }
 
 export async function assertAuthenticatedChatGptPage(page: Page): Promise<void> {
+  if (isGoogleAccountSignInUrl(page.url())) {
+    throw new Error(GOOGLE_SECURE_BROWSER_RELOGIN_MESSAGE);
+  }
   const loginButtons = page.getByRole("button", { name: "Log in", exact: true });
   if (await anyVisible(loginButtons)) {
-    throw new Error("ChatGPT is signed out: a visible Log in button is present");
+    throw new Error(chatGptReauthenticationMessage(page.url()));
   }
 
   const accountControl = page.getByRole("button", { name: /(?:profile|account) menu/i }).or(

@@ -8,7 +8,13 @@ import {
   deepSeekLoginVerificationMarkerPath,
 } from "./deepseek-browser-login";
 import { getServiceStatus } from "./service";
-import { installedTunnelClientVersion, tunnelClientVersion, tunnelStatus } from "./tunnel";
+import {
+  installedTunnelClientBuildId,
+  installedTunnelClientVersion,
+  tunnelClientBuildId,
+  tunnelClientVersion,
+  tunnelStatus,
+} from "./tunnel";
 import { getTunnelServiceStatus } from "./tunnel-service";
 
 export type CheckStatus = "ok" | "warning" | "error";
@@ -164,12 +170,14 @@ export async function runDoctor(): Promise<DoctorReport> {
     } else {
       const installedVersion = installedTunnelClientVersion(settings.binaryPath);
       const requiredVersion = tunnelClientVersion();
-      checks.push(installedVersion === requiredVersion
-        ? { id: "tunnel-binary", status: "ok", message: `Pinned openai/tunnel-client ${requiredVersion} is installed` }
+      const installedBuild = installedTunnelClientBuildId(settings.binaryPath);
+      const requiredBuild = tunnelClientBuildId();
+      checks.push(installedVersion === requiredVersion && installedBuild === requiredBuild
+        ? { id: "tunnel-binary", status: "ok", message: `Pinned no-expiry tunnel-client build ${requiredBuild} is installed` }
         : {
             id: "tunnel-binary",
             status: "error",
-            message: `tunnel-client version mismatch; expected ${requiredVersion}, found ${installedVersion ?? "unknown"}`,
+            message: `tunnel-client build mismatch; expected ${requiredBuild}, found ${installedBuild ?? installedVersion ?? "unknown"}`,
             detail: "Rerun setup to install the pinned tunnel client before starting Full mode.",
           });
     }

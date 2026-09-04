@@ -77,6 +77,7 @@ export function buildChatGptWebModel(
 export function buildDeepSeekWebModel(
   templateValue: unknown,
   route: DeepSeekWebModelRoute,
+  config: AppConfig,
 ): JsonObject {
   const template = object(templateValue, `native ${NATIVE_TEMPLATE_MODEL} model`);
   if (slug(template) !== NATIVE_TEMPLATE_MODEL) {
@@ -90,6 +91,9 @@ export function buildDeepSeekWebModel(
     input_modalities: ["text"],
     visibility: "list",
     supported_in_api: false,
+    // DeepSeek must receive Codex's ordinary per-tool surface. Inheriting the
+    // current native template's `code_mode_only` collapses that surface into the
+    // special `exec` custom tool and hides the individual tool lifecycle.
     tool_mode: null,
     upgrade: null,
     default_reasoning_level: route.codexEffort,
@@ -147,7 +151,7 @@ export function augmentNativeModelCatalog(
   const chatGptWebModels = availableChatGptWebModelRoutes(config.proAvailable)
     .map(route => buildChatGptWebModel(template, route, config));
   const deepSeekWebModels = availableDeepSeekWebModelRoutes(config.deepSeekWeb?.enabled === true)
-    .map(route => buildDeepSeekWebModel(template, route));
+    .map(route => buildDeepSeekWebModel(template, route, config));
   return {
     ...structuredClone(catalog),
     models: [...nativeModels, ...chatGptWebModels, ...deepSeekWebModels],

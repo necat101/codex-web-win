@@ -16,13 +16,32 @@ import {
 } from "./prompt";
 import {
   deepSeekEffectiveTools,
-  deepSeekResponseNeedsToolRecovery,
+  deepSeekResponseRecoveryReason,
+  deepSeekToolCallRequired,
   deepSeekToolRecoveryPrompt,
-  parseDeepSeekToolRequests,
+  parseDeepSeekToolResponseCandidates,
+  type DeepSeekResponseRecoveryReason,
   type DeepSeekToolRequest,
 } from "./tool-protocol";
 
-const DEEPSEEK_MAX_NARRATION_RECOVERY_ATTEMPTS = 2;
+const DEEPSEEK_MAX_CORRECTION_ATTEMPTS = 2;
+
+function deepSeekTurnRecoveryReason(
+  rawText: string,
+  output: string,
+  toolCapable: boolean,
+  toolRequired: boolean,
+  protocolError: Error | undefined,
+): DeepSeekResponseRecoveryReason | undefined {
+  if (protocolError) return "tool_protocol";
+  const candidates = rawText === output ? [rawText] : [rawText, output];
+  for (const candidate of candidates) {
+    const reason = deepSeekResponseRecoveryReason(candidate);
+    if (reason === "capability_refusal" && !toolCapable) continue;
+    if (reason) return reason;
+  }
+  return toolRequired ? "required_tool" : undefined;
+}
 
 export function emitDeepSeekToolRequests(
   requests: DeepSeekToolRequest[],
@@ -212,9 +231,9 @@ export function createDeepSeekWebAdapter(provider: CodexProviderConfig): Provide
       try {
         if (incoming.abortSignal?.aborted) throw new DOMException("DeepSeek Web turn aborted", "AbortError");
         const route = requireDeepSeekWebModelRoute(parsed.modelId, provider.deepseekWeb?.enabled === true);
-        const prompt = compileDeepSeekWebPrompt(parsed);
-        const traceId = deepSeekTraceId(parsed, route.slug, prompt.text);
         const conversationKey = deepSeekConversationKey(parsed, route.slug);
+        const prompt = compileDeepSeekWebPrompt(parsed, { contextKey: conversationKey });
+        const traceId = deepSeekTraceId(parsed, route.slug, prompt.text);
         const continuationPrompt = conversationKey
           ? compileDeepSeekWebContinuationPrompt(parsed)
           : undefined;
@@ -223,6 +242,7 @@ export function createDeepSeekWebAdapter(provider: CodexProviderConfig): Provide
           ? compileDeepSeekWebFollowUpPrompt(parsed, continueFromTraceId)
           : undefined;
         const toolCapable = deepSeekEffectiveTools(parsed).length > 0;
+        const toolRequired = deepSeekToolCallRequired(parsed);
         let output = "";
         let result = await worker.run({
           traceId,
@@ -248,18 +268,23 @@ export function createDeepSeekWebAdapter(provider: CodexProviderConfig): Provide
         let activeTraceId = traceId;
         let inputTokens = estimateTokens(result.inputText, route.slug);
         let outputTokens = estimateTokens(output, route.slug);
-        let toolRequests = toolCapable
-          ? parseDeepSeekToolRequests(result.rawText, parsed)
-            ?? (result.rawText !== output ? parseDeepSeekToolRequests(output, parsed) : undefined)
-          : undefined;
+        let parseOutcome = parseDeepSeekToolResponseCandidates([result.rawText, output], parsed);
+        let toolRequests = parseOutcome.requests;
+        let recoveryReason = deepSeekTurnRecoveryReason(
+          result.rawText,
+          output,
+          toolCapable,
+          toolRequired,
+          parseOutcome.protocolError,
+        );
 
         let recoveryAttempts = 0;
         while (
           !toolRequests
-          && deepSeekResponseNeedsToolRecovery(result.rawText || output)
-          && recoveryAttempts < DEEPSEEK_MAX_NARRATION_RECOVERY_ATTEMPTS
+          && recoveryReason
+          && recoveryAttempts < DEEPSEEK_MAX_CORRECTION_ATTEMPTS
         ) {
-          const recoveryPrompt = deepSeekToolRecoveryPrompt(parsed);
+          const recoveryPrompt = deepSeekToolRecoveryPrompt(parsed, recoveryReason);
           const previousTraceId = activeTraceId;
           const recoveryTraceId = deepSeekToolRecoveryTraceId(previousTraceId, result.rawText || output);
           output = "";
@@ -280,17 +305,28 @@ export function createDeepSeekWebAdapter(provider: CodexProviderConfig): Provide
           activeTraceId = recoveryTraceId;
           inputTokens += estimateTokens(result.inputText, route.slug);
           outputTokens += estimateTokens(output, route.slug);
-          toolRequests = toolCapable
-            ? parseDeepSeekToolRequests(result.rawText, parsed)
-              ?? (result.rawText !== output ? parseDeepSeekToolRequests(output, parsed) : undefined)
-            : undefined;
+          parseOutcome = parseDeepSeekToolResponseCandidates([result.rawText, output], parsed);
+          toolRequests = parseOutcome.requests;
+          recoveryReason = deepSeekTurnRecoveryReason(
+            result.rawText,
+            output,
+            toolCapable,
+            toolRequired,
+            parseOutcome.protocolError,
+          );
           recoveryAttempts++;
         }
 
-        if (!toolRequests && deepSeekResponseNeedsToolRecovery(result.rawText || output)) {
-          throw new Error(
-            "DeepSeek Web repeatedly returned planning/progress narration instead of completing the task or requesting a Codex tool",
-          );
+        if (!toolRequests && recoveryReason) {
+          const detail = parseOutcome.protocolError?.message;
+          const message = recoveryReason === "tool_protocol"
+            ? `DeepSeek Web repeatedly emitted an invalid Codex tool request${detail ? `: ${detail}` : ""}`
+            : recoveryReason === "capability_refusal"
+              ? "DeepSeek Web repeatedly refused to use Codex tools that were active for the turn"
+              : recoveryReason === "required_tool"
+                ? "DeepSeek Web did not provide the tool call required by the active Codex tool choice"
+                : "DeepSeek Web repeatedly returned planning/progress narration instead of completing the task or requesting a Codex tool";
+          throw new Error(message);
         }
 
         const usage = {

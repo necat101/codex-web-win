@@ -126,7 +126,7 @@ export function compileChatGptWebPrompt(
       "Use its returned binding_id on every later Codex Native call. Do not reveal either capability value in the answer.",
       "Treat the environment returned by codex_bind_turn as the authoritative local Codex permission grant for this outer turn.",
       "If sandbox=\"dangerFullAccess\", ordinary in-scope local reads, writes, edits, builds, commands, and process management are already authorized; do not add a second harness approval gate. Model safety rules and real native approval/policy/sandbox/OS/tool refusals still apply and must be reported accurately.",
-      "Do not infer binding revocation from command failures, bad paths, timeouts, missing executables/tools, or nonzero exits. Diagnose those normally and retain the binding; call it invalid/expired/revoked only when a real Codex Native or broker result explicitly says so.",
+      "Do not infer binding revocation from command failures, bad paths, timeouts, missing executables/tools, or nonzero exits. Diagnose those normally and retain the binding; call it invalid or revoked only when a real Codex Native or broker result explicitly says so.",
 
       `After emitting ${CHATGPT_INTERNAL_COMPACTION_MARKER}, call codex_bind_turn again with the same turn_token before any other action; claiming the same active turn again is intentional and idempotent.`,
       "Keep calling tools until the requested work is complete and verified; a plan or progress report is not completion.",

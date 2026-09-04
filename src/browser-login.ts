@@ -10,6 +10,8 @@ import {
   assertTemporaryChatPage,
   CHATGPT_TEMPORARY_CHAT_URL,
   detectChatGptProCapability,
+  GOOGLE_SECURE_BROWSER_RELOGIN_MESSAGE,
+  isGoogleAccountSignInUrl,
 } from "./chatgpt-session";
 
 export interface BrowserLoginResult {
@@ -29,7 +31,18 @@ export function loginVerificationMarkerPath(storageStatePath: string): string {
   return `${storageStatePath}.verified.json`;
 }
 
+// Keep the post-login extraction/verification launches visible. ChatGPT's web
+// app is not guaranteed to behave identically in headless Chrome, and these
+// short visible launches also make progress obvious after the user closes the
+// manual login window. Google credential entry still happens only in the first,
+// non-Playwright Chrome process below.
+export const CHATGPT_LOGIN_VERIFICATION_HEADLESS = false;
+
 export function normalChromeLoginArguments(profileDir: string): string[] {
+  // Google OAuth's secure-browser policy prohibits credential entry in an
+  // automation-controlled user agent. This process is deliberately launched
+  // as ordinary installed Chrome, outside Playwright. Keep remote-debugging,
+  // WebDriver, and automation-evasion switches out of this argument list.
   return [
     `--user-data-dir=${profileDir}`,
     "--new-window",
@@ -56,7 +69,7 @@ async function inspectStoredState(
 ): Promise<{ proAvailable: boolean; url: string }> {
   const verifierBrowser = await chromium.launch({
     executablePath: config.chromeExecutablePath,
-    headless: false,
+    headless: CHATGPT_LOGIN_VERIFICATION_HEADLESS,
     env: childProcessEnvironment(),
     ignoreDefaultArgs: ["--password-store=basic", "--use-mock-keychain"],
     args: ["--no-first-run", "--no-default-browser-check"],
@@ -66,6 +79,9 @@ async function inspectStoredState(
     try {
       const verifierPage = await verifierContext.newPage();
       await verifierPage.goto(CHATGPT_TEMPORARY_CHAT_URL, { waitUntil: "domcontentloaded", timeout: 60_000 });
+      if (isGoogleAccountSignInUrl(verifierPage.url())) {
+        throw new Error(GOOGLE_SECURE_BROWSER_RELOGIN_MESSAGE);
+      }
       await verifierPage.getByRole("textbox", { name: "Chat with ChatGPT" }).waitFor({ state: "visible", timeout: 60_000 });
       await assertAuthenticatedChatGptPage(verifierPage);
       await assertTemporaryChatPage(verifierPage);
@@ -227,7 +243,7 @@ export async function loginToChatGpt(
   try {
     if (options.announce !== false) {
       process.stdout.write(
-        "A fresh normal Chrome profile is open. Sign in to ChatGPT, confirm that the composer is visible, then quit this dedicated Chrome instance completely.\n",
+        "A fresh normal Chrome profile is open outside browser automation. Sign in to ChatGPT (including Google sign-in if needed), confirm that the composer is visible, then quit this dedicated Chrome instance completely.\n",
       );
     }
 
@@ -252,7 +268,7 @@ export async function loginToChatGpt(
     process.stdout.write("Login Chrome closed; extracting ChatGPT session state...\n");
     context = await chromium.launchPersistentContext(profileDir, {
       executablePath: config.chromeExecutablePath,
-      headless: false,
+      headless: CHATGPT_LOGIN_VERIFICATION_HEADLESS,
       env: childProcessEnvironment(),
       ignoreDefaultArgs: ["--password-store=basic", "--use-mock-keychain"],
       args: ["--no-first-run", "--no-default-browser-check"],
@@ -263,13 +279,19 @@ export async function loginToChatGpt(
       waitUntil: "domcontentloaded",
       timeout: 60_000,
     });
+    if (isGoogleAccountSignInUrl(page.url())) {
+      throw new Error(GOOGLE_SECURE_BROWSER_RELOGIN_MESSAGE);
+    }
     const composer = page.getByRole("textbox", { name: "Chat with ChatGPT" }).or(
       page.locator('[data-testid="prompt-textarea"], [contenteditable="true"][data-lexical-editor="true"]'),
     ).first();
     try {
       await composer.waitFor({ state: "visible", timeout: options.timeoutMs ?? 60_000 });
     } catch {
-      throw new Error("The authenticated ChatGPT page did not produce a visible composer");
+      throw new Error(
+        "The normal Chrome login window was closed before ChatGPT authentication was complete. "
+        + `${GOOGLE_SECURE_BROWSER_RELOGIN_MESSAGE}`,
+      );
     }
     await assertAuthenticatedChatGptPage(page);
     await assertTemporaryChatPage(page);

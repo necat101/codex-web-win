@@ -4,7 +4,7 @@ import { expandUserPath, resolveBrokerSocketPath } from "../../config";
 import { namespacedToolName, type AdapterEvent, type CodexContentPart, type CodexParsedRequest, type CodexProviderConfig, type CodexTool, type CodexToolResultMessage, type CodexUsage } from "../../types";
 import { AdapterTurnError, type ProviderAdapter } from "../base";
 import { parseDataUrl } from "../image";
-import { ChatGptBrowserWorker, DEFAULT_CHATGPT_TOOL_TURN_TIMEOUT_MS, DEFAULT_CHATGPT_TURN_TIMEOUT_MS } from "./browser-worker";
+import { ChatGptBrowserWorker } from "./browser-worker";
 import { extractChatGptTurnEnvironment, extractChatGptTurnIdentity } from "./environment";
 import { resolveChatGptWebModelMode, type ChatGptWebCapabilities } from "./model";
 import { chatGptReadOnlyContextWarning, compileChatGptWebPrompt } from "./prompt";
@@ -291,8 +291,6 @@ export function validateBatchTools(tools: CodexTool[], requests: BrokerToolReque
 export function createChatGptWebAdapter(provider: CodexProviderConfig): ProviderAdapter {
   const worker = ChatGptBrowserWorker.forProvider(provider);
   const broker = TurnBroker.forSocket(brokerSocketPath(provider));
-  const timeoutMs = provider.chatgptWeb?.turnTimeoutMs ?? DEFAULT_CHATGPT_TURN_TIMEOUT_MS;
-  const toolTimeoutMs = Math.max(timeoutMs, DEFAULT_CHATGPT_TOOL_TURN_TIMEOUT_MS);
   const capabilities: ChatGptWebCapabilities = {
     localToolsEnabled: provider.chatgptWeb?.localToolsEnabled === true,
     proAvailable: provider.chatgptWeb?.proAvailable === true,
@@ -364,7 +362,7 @@ export function createChatGptWebAdapter(provider: CodexProviderConfig): Provider
       reasoning: parsed.options.reasoning,
       capabilities,
       prepare: async () => {
-        const turnToken = await broker.register(environment, toolTimeoutMs + 60_000, traceId);
+        const turnToken = await broker.register(environment, traceId);
         // Compaction can supersede this runtime while registration is still in
         // flight. In that case cancel() has not seen an active token to revoke;
         // close the just-created channel before exposing it to either side.
@@ -388,9 +386,6 @@ export function createChatGptWebAdapter(provider: CodexProviderConfig): Provider
       onReasoningSummary: text => trace.push({ kind: "reasoning", text }),
       onCommentary: (text, continuation) => trace.push({ kind: "commentary", text, ...(continuation ? { continuation: true } : {}) }),
       onTextDelta: delta => text.push(delta),
-      onActivity: () => {
-        if (activeToken) broker.renew(activeToken);
-      },
       pendingToolCount: () => activeToken ? broker.pendingToolCount(activeToken) : 0,
       waitForPendingToolCountChange: (previousCount, timeoutMs) => activeToken
         ? broker.waitForPendingToolCountChange(activeToken, previousCount, timeoutMs, browserAbort.signal)

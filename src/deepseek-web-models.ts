@@ -23,14 +23,14 @@ export const DEEPSEEK_WEB_MODEL_ROUTES: readonly DeepSeekWebModelRoute[] = [
   {
     slug: "deepseek-web/instant",
     displayName: "DeepSeek Web — Instant",
-    description: "DeepSeek Web Instant through the native Codex harness. Local Codex tool calls are unavailable in this mode.",
+    description: "DeepSeek Web Instant through the native Codex harness. Local Codex tool calls are relayed in full-harness mode.",
     codexEffort: "low",
     adapterMode: "instant",
   },
   {
     slug: "deepseek-web/expert",
     displayName: "DeepSeek Web — Expert",
-    description: "DeepSeek Web Expert through the native Codex harness. Local Codex tool calls are unavailable in this mode.",
+    description: "DeepSeek Web Expert through the native Codex harness. Local Codex tool calls are relayed in full-harness mode.",
     codexEffort: "high",
     adapterMode: "expert",
   },
