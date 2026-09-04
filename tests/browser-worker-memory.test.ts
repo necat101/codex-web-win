@@ -1,5 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import {
+  CHATGPT_ATTACHMENT_INPUT_TIMEOUT_MS,
+  CHATGPT_ATTACHMENT_NETWORK_SETTLE_MS,
+  CHATGPT_ATTACHMENT_REMOVE_CONTROL_SELECTOR,
+  CHATGPT_ATTACHMENT_STAGE_TIMEOUT_MS,
+  CHATGPT_ATTACHMENT_UPLOAD_TIMEOUT_MS,
   CHATGPT_LOW_POWER_STYLE,
   CHATGPT_LOW_RESOURCE_LAUNCH_ARGS,
   CHATGPT_MAX_SCHEDULER_GAP_EXTENSION_MS,
@@ -12,16 +17,23 @@ import {
   CHATGPT_RECOVERY_SIGNAL_POLL_MS,
   CHATGPT_RESPONSE_POLL_MS,
   CHATGPT_RENDERER_TELEMETRY_MS,
-  CHATGPT_RESTORE_BACKGROUND_THROTTLING_ARGS,
+  CHATGPT_IGNORED_DEFAULT_ARGS,
   CHATGPT_TOOL_WAIT_POLL_MS,
   CHATGPT_TRACE_POLL_MS,
   CHATGPT_UI_POLL_MS,
+  chatGptAttachmentStatusTextKind,
+  chatGptAttachmentUploadProofKind,
   chatGptTurnIsComplete,
+  chatGptRequestLooksLikeAttachmentUpload,
   chatGptPollingProfile,
   chatGptRendererTelemetryEnabled,
   chatGptResponsePollInterval,
   chatGptSchedulerGapExtension,
+  chatGptTemporaryChatPersonalizationState,
+  chatGptTurnInactivityExpired,
+  ChatGptAttachmentNetworkTracker,
   ChatGptBrowserWorker,
+  ChatGptAttachmentReadinessTracker,
   ChatGptCompletionTracker,
   ChatGptTurnDomHealthTracker,
   ChatGptVisibleTraceTracker,
@@ -29,19 +41,232 @@ import {
 } from "../src/adapters/chatgpt-web/browser-worker";
 import { ChatGptHeartbeatFeed, ChatGptTextFeed } from "../src/adapters/chatgpt-web/turn-execution";
 
+function fakePageEvents() {
+  const listeners = new Map<string, Set<(value: any) => unknown>>();
+  const page = {
+    on(event: string, listener: (value: any) => unknown) {
+      let eventListeners = listeners.get(event);
+      if (!eventListeners) {
+        eventListeners = new Set();
+        listeners.set(event, eventListeners);
+      }
+      eventListeners.add(listener);
+      return page;
+    },
+    off(event: string, listener: (value: any) => unknown) {
+      listeners.get(event)?.delete(listener);
+      return page;
+    },
+    async emit(event: string, value: any) {
+      await Promise.all([...listeners.get(event) ?? []].map(listener => listener(value)));
+    },
+  };
+  return page;
+}
+
 describe("ChatGPT browser worker memory reuse", () => {
-  test("restores Chromium background throttling during browser automation", () => {
-    expect(CHATGPT_RESTORE_BACKGROUND_THROTTLING_ARGS).toEqual([
-      "--disable-background-timer-throttling",
-      "--disable-backgrounding-occluded-windows",
-      "--disable-renderer-backgrounding",
-    ]);
+  test("recognizes both Temporary Chat personalization states idempotently", () => {
+    expect(chatGptTemporaryChatPersonalizationState(["Personalized"])).toBe("personalized");
+    expect(chatGptTemporaryChatPersonalizationState(["Personalized menu"])).toBe("personalized");
+    expect(chatGptTemporaryChatPersonalizationState(["Unpersonalized"])).toBe("unpersonalized");
+    expect(chatGptTemporaryChatPersonalizationState([null, "  Unpersonalized  "])).toBe("unpersonalized");
+    expect(chatGptTemporaryChatPersonalizationState(["Temporary Chat"])).toBe("unknown");
   });
 
-  test("disables remote image rendering without request interception", () => {
-    expect(CHATGPT_LOW_RESOURCE_LAUNCH_ARGS).toEqual([
-      "--blink-settings=imagesEnabled=false",
-    ]);
+  test("does not treat an attachment card and enabled Send button as a completed upload", () => {
+    const tracker = new ChatGptAttachmentReadinessTracker();
+    const uploading = {
+      attachedCount: 1,
+      expectedCount: 1,
+      sendEnabled: true,
+      pendingUi: false,
+      uploadedUiCount: 0,
+      uploadRequestsSeen: 1,
+      uploadRequestsPending: 1,
+      uploadRequestsFailed: 0,
+      successfulUploads: 0,
+      uploadActivitySequence: 1,
+    };
+
+    expect(tracker.update(uploading, 1_000)).toBe(false);
+    const uploaded = {
+      ...uploading,
+      uploadRequestsPending: 0,
+      successfulUploads: 1,
+      uploadActivitySequence: 2,
+    };
+    expect(tracker.update(uploaded, 2_000)).toBe(false);
+    expect(tracker.update(uploaded, 2_000 + CHATGPT_ATTACHMENT_NETWORK_SETTLE_MS - 1)).toBe(false);
+    expect(tracker.update(uploaded, 2_000 + CHATGPT_ATTACHMENT_NETWORK_SETTLE_MS)).toBe(true);
+  });
+
+  test("never accepts the former no-network fallback and waits for delayed proven upload", () => {
+    const tracker = new ChatGptAttachmentReadinessTracker();
+    const readyWithoutObservedNetwork = {
+      attachedCount: 2,
+      expectedCount: 2,
+      sendEnabled: true,
+      pendingUi: false,
+      uploadedUiCount: 0,
+      uploadRequestsSeen: 0,
+      uploadRequestsPending: 0,
+      uploadRequestsFailed: 0,
+      successfulUploads: 0,
+      uploadActivitySequence: 0,
+    };
+
+    expect(tracker.update(readyWithoutObservedNetwork, 0)).toBe(false);
+    expect(tracker.update(readyWithoutObservedNetwork, 60_000)).toBe(false);
+    expect(tracker.update({
+      ...readyWithoutObservedNetwork,
+      uploadRequestsSeen: 1,
+      uploadRequestsPending: 1,
+      uploadActivitySequence: 1,
+    }, 60_001)).toBe(false);
+    const completed = {
+      ...readyWithoutObservedNetwork,
+      uploadRequestsSeen: 2,
+      successfulUploads: 2,
+      uploadActivitySequence: 2,
+    };
+    expect(tracker.update(completed, 61_000)).toBe(false);
+    expect(tracker.update(completed, 61_000 + CHATGPT_ATTACHMENT_NETWORK_SETTLE_MS)).toBe(true);
+  });
+
+  test("accepts an explicit uploaded state when network events are hidden by the page", () => {
+    const tracker = new ChatGptAttachmentReadinessTracker();
+    const uploaded = {
+      attachedCount: 1,
+      expectedCount: 1,
+      sendEnabled: true,
+      pendingUi: false,
+      uploadedUiCount: 1,
+      uploadRequestsSeen: 0,
+      uploadRequestsPending: 0,
+      uploadRequestsFailed: 0,
+      successfulUploads: 0,
+      uploadActivitySequence: 0,
+    };
+
+    expect(tracker.update(uploaded, 10_000)).toBe(false);
+    expect(tracker.update(uploaded, 10_000 + CHATGPT_ATTACHMENT_NETWORK_SETTLE_MS)).toBe(true);
+  });
+
+  test("recognizes attachment upload traffic without matching conversation submission", () => {
+    expect(chatGptRequestLooksLikeAttachmentUpload("POST", "https://chatgpt.com/backend-api/files")).toBe(true);
+    expect(chatGptRequestLooksLikeAttachmentUpload("POST", "https://chatgpt.com/backend-api/files/file-1/uploaded")).toBe(true);
+    expect(chatGptRequestLooksLikeAttachmentUpload("PUT", "https://fixture.blob.core.windows.net/container/image.png?sig=x")).toBe(true);
+    expect(chatGptRequestLooksLikeAttachmentUpload("PUT", "https://files.oaiusercontent.com/file-1")).toBe(true);
+    expect(chatGptRequestLooksLikeAttachmentUpload("POST", "https://chatgpt.com/backend-api/conversation")).toBe(false);
+    expect(chatGptRequestLooksLikeAttachmentUpload("GET", "https://chatgpt.com/backend-api/files/file-1")).toBe(false);
+    expect(chatGptAttachmentUploadProofKind("POST", "https://chatgpt.com/backend-api/files")).toBeUndefined();
+    expect(chatGptAttachmentUploadProofKind("PUT", "https://fixture.blob.core.windows.net/container/image.png?sig=x")).toBe("transfer");
+    expect(chatGptAttachmentUploadProofKind("POST", "https://chatgpt.com/backend-api/files/file-1/uploaded")).toBe("finalize");
+  });
+
+  test("records HTTP and transport upload failures without treating them as success", async () => {
+    const httpPage = fakePageEvents();
+    const httpTracker = new ChatGptAttachmentNetworkTracker(httpPage as any);
+    const httpRequest = {
+      method: () => "PUT",
+      url: () => "https://fixture.blob.core.windows.net/container/http-failure.png",
+      response: async () => ({ ok: () => false }),
+    };
+    await httpPage.emit("request", httpRequest);
+    await httpPage.emit("requestfinished", httpRequest);
+    expect(httpTracker.snapshot()).toMatchObject({ pending: 0, failed: 1, successfulUploads: 0 });
+    httpTracker.stop();
+
+    const transportPage = fakePageEvents();
+    const transportTracker = new ChatGptAttachmentNetworkTracker(transportPage as any);
+    const transportRequest = {
+      method: () => "PUT",
+      url: () => "https://fixture.blob.core.windows.net/container/transport-failure.png",
+      response: async () => null,
+    };
+    await transportPage.emit("request", transportRequest);
+    await transportPage.emit("requestfailed", transportRequest);
+    expect(transportTracker.snapshot()).toMatchObject({ pending: 0, failed: 1, successfulUploads: 0 });
+    transportTracker.stop();
+  });
+
+  test("counts only a successful transfer or finalize request as upload proof", async () => {
+    const page = fakePageEvents();
+    const tracker = new ChatGptAttachmentNetworkTracker(page as any);
+    const request = {
+      method: () => "PUT",
+      url: () => "https://fixture.blob.core.windows.net/container/success.png",
+      response: async () => ({ ok: () => true }),
+    };
+    await page.emit("request", request);
+    await page.emit("requestfinished", request);
+    expect(tracker.snapshot()).toMatchObject({ pending: 0, failed: 0, successfulUploads: 1 });
+    tracker.stop();
+  });
+
+  test("preserves Playwright background liveness for long browser turns", () => {
+    expect(CHATGPT_IGNORED_DEFAULT_ARGS).toEqual([]);
+  });
+
+  test("keeps image rendering enabled for attachment chips", () => {
+    expect(CHATGPT_LOW_RESOURCE_LAUNCH_ARGS).toEqual([]);
+  });
+
+  test("keeps the outer attachment stage beyond both inner deadlines", () => {
+    expect(CHATGPT_ATTACHMENT_STAGE_TIMEOUT_MS)
+      .toBeGreaterThan(CHATGPT_ATTACHMENT_INPUT_TIMEOUT_MS + CHATGPT_ATTACHMENT_UPLOAD_TIMEOUT_MS);
+  });
+
+  test("recognizes current file, image, attachment, and test-id remove controls", () => {
+    expect(CHATGPT_ATTACHMENT_REMOVE_CONTROL_SELECTOR).toContain('Remove file');
+    expect(CHATGPT_ATTACHMENT_REMOVE_CONTROL_SELECTOR).toContain('Remove image');
+    expect(CHATGPT_ATTACHMENT_REMOVE_CONTROL_SELECTOR).toContain('Remove attachment');
+    expect(CHATGPT_ATTACHMENT_REMOVE_CONTROL_SELECTOR).toContain('remove-attachment');
+  });
+
+  test("does not treat prompt prose containing processing as attachment status", () => {
+    expect(chatGptAttachmentStatusTextKind({
+      text: "Please keep processing the image after it uploads.",
+      role: "textbox",
+      ariaLive: null,
+      testId: "prompt-textarea",
+    })).toBeUndefined();
+    expect(chatGptAttachmentStatusTextKind({
+      text: "Processing image",
+      role: "status",
+      ariaLive: "polite",
+      testId: "attachment-status",
+    })).toBe("pending");
+  });
+
+  test("aborts a stuck file attachment stage and discards its browser context", async () => {
+    let closeCalls = 0;
+    const context = {
+      close: async () => {
+        closeCalls += 1;
+      },
+    };
+    const worker = new (ChatGptBrowserWorker as any)({}, {});
+    (worker as any).context = context;
+    (worker as any).page = { isClosed: () => false };
+    const abort = new AbortController();
+    const stage = (worker as any).runStage(
+      "attachment-cancel-regression",
+      "file_attachment",
+      60_000,
+      () => new Promise<void>(() => {}),
+      abort.signal,
+    );
+
+    abort.abort();
+
+    await expect(stage).rejects.toMatchObject({
+      name: "AbortError",
+      message: "ChatGPT web turn aborted",
+    });
+    expect(closeCalls).toBe(1);
+    expect((worker as any).context).toBeUndefined();
+    expect((worker as any).page).toBeUndefined();
   });
 
   test("backs off DOM polling while Codex Native tool results are pending", () => {
@@ -287,6 +512,16 @@ describe("ChatGPT browser worker memory reuse", () => {
     expect(remaining).toBe(0);
     expect(chatGptSchedulerGapExtension(31_000, remaining)).toBe(0);
     expect(chatGptSchedulerGapExtension(29_999, CHATGPT_MAX_SCHEDULER_GAP_EXTENSION_MS)).toBe(0);
+  });
+
+  test("never expires a tool-capable turn solely because arbitrary time elapsed", () => {
+    const deadline = 1_000;
+    for (const now of [deadline, deadline + 30 * 60_000, Number.MAX_SAFE_INTEGER]) {
+      expect(chatGptTurnInactivityExpired(true, now, deadline)).toBe(false);
+    }
+
+    expect(chatGptTurnInactivityExpired(false, deadline - 1, deadline)).toBe(false);
+    expect(chatGptTurnInactivityExpired(false, deadline, deadline)).toBe(true);
   });
 
   test("delivers browser heartbeats only when the worker pulses", async () => {

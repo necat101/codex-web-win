@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { Buffer } from "node:buffer";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
@@ -29,10 +29,14 @@ import {
 } from "../src/adapters/deepseek-web/prompt";
 import {
   deepSeekEffectiveTools,
+  deepSeekResponseRecoveryReason,
   deepSeekResponseNeedsToolRecovery,
+  deepSeekToolCallRequired,
   deepSeekToolRecoveryPrompt,
+  DeepSeekToolProtocolError,
   normalizeDeepSeekApplyPatchBlankLines,
   parseDeepSeekToolRequests,
+  parseDeepSeekToolResponseCandidates,
   wrapDeepSeekWindowsPowerShellCommand,
 } from "../src/adapters/deepseek-web/tool-protocol";
 import { deepSeekLoginVerificationMarkerPath } from "../src/deepseek-browser-login";
@@ -123,6 +127,74 @@ describe("DeepSeek Web prompt and browser contract", () => {
     expect(compiled!.sourceChars).toBe(compiled!.text.length);
   });
 
+  test("spools oversized fresh-chat history into one rolling local context file", () => {
+    const root = mkdtempSync(join(tmpdir(), "deepseek-context-spool-"));
+    temporaryRoots.push(root);
+    const parsed = parsedRequest();
+    parsed.context.tools = [{
+      name: "exec_command",
+      description: "Run a command in the current workspace",
+      parameters: {
+        type: "object",
+        properties: { cmd: { type: "string" } },
+        required: ["cmd"],
+      },
+    }];
+    parsed.context.messages.splice(1, 0, {
+      role: "user",
+      content: `OLD_CONTEXT_SENTINEL ${"historical payload ".repeat(1800)}`,
+      timestamp: 1.5,
+    });
+    parsed.context.messages.push({ role: "user", content: "LATEST_CONTEXT_SENTINEL", timestamp: 5 });
+
+    const compiled = compileDeepSeekWebPrompt(parsed, {
+      contextKey: "thread-rolling-context",
+      contextDirectory: root,
+      pasteBudgetChars: 12_000,
+      inlineContextChars: 2_500,
+    });
+
+    expect(compiled.contextArchive).toBeDefined();
+    expect(compiled.text).toContain("rolling local text file");
+    expect(compiled.text).toContain("Do not dump or cat the entire archive");
+    expect(compiled.text).toContain("LATEST_CONTEXT_SENTINEL");
+    expect(compiled.text).not.toContain("OLD_CONTEXT_SENTINEL");
+    expect(compiled.text.length).toBeLessThan(12_000);
+
+    const firstPath = compiled.contextArchive!.path;
+    const firstArchive = readFileSync(firstPath, "utf8");
+    expect(firstArchive).toContain("<priority_instructions>");
+    expect(firstArchive).toContain("Preserve repository facts.");
+    expect(firstArchive).toContain("OLD_CONTEXT_SENTINEL");
+    expect(firstArchive).toContain("LATEST_CONTEXT_SENTINEL");
+
+    parsed.context.messages.push({ role: "user", content: "ROLLING_UPDATE_SENTINEL", timestamp: 6 });
+    const updated = compileDeepSeekWebPrompt(parsed, {
+      contextKey: "thread-rolling-context",
+      contextDirectory: root,
+      pasteBudgetChars: 12_000,
+      inlineContextChars: 2_500,
+    });
+    expect(updated.contextArchive!.path).toBe(firstPath);
+    expect(readFileSync(firstPath, "utf8")).toContain("ROLLING_UPDATE_SENTINEL");
+  });
+
+  test("keeps full oversized history inline when no command tool can recover a local archive", () => {
+    const parsed = parsedRequest();
+    parsed.context.messages.splice(1, 0, {
+      role: "user",
+      content: `NO_READER_SENTINEL ${"payload ".repeat(3000)}`,
+      timestamp: 1.5,
+    });
+
+    const compiled = compileDeepSeekWebPrompt(parsed, {
+      contextKey: "thread-without-reader",
+      pasteBudgetChars: 10_000,
+    });
+    expect(compiled.contextArchive).toBeUndefined();
+    expect(compiled.text).toContain("NO_READER_SENTINEL");
+  });
+
   test("teaches DeepSeek to act through Codex tools instead of asking discoverable questions", () => {
     const parsed = parsedRequest();
     parsed.context.tools = [{
@@ -136,6 +208,7 @@ describe("DeepSeek Web prompt and browser contract", () => {
     }];
     const compiled = compileDeepSeekWebPrompt(parsed);
     expect(compiled.text).toContain("Codex harness tools are available indirectly");
+    expect(compiled.text).toContain("never overrides safety policy, user authorization, sandboxing");
     expect(compiled.text).toContain("prefer using the tools to inspect and act instead of asking the user");
     expect(compiled.text).toContain("do not narrate your analysis, plan, or intended next step");
     expect(compiled.text).toContain("Do not replace a tool request with progress prose");
@@ -184,6 +257,56 @@ describe("DeepSeek Web prompt and browser contract", () => {
     expect(recoveryTraceId).toMatch(/^[0-9a-f]{12}$/);
     expect(recoveryTraceId).toBe(deepSeekToolRecoveryTraceId("abcdef123456", stalled));
     expect(recoveryTraceId).not.toBe("abcdef123456");
+  });
+
+  test("recovers diverse planning and mistaken capability refusals without overriding policy failures", () => {
+    const recoverable = [
+      "I can't access your filesystem or run commands here. Please paste the file.",
+      "I cannot access your local filesystem.",
+      "I don't have access to tools in this environment.",
+      "I’m unable to run commands or edit files here.",
+      "Please run this command yourself.",
+      "I can only provide instructions, not make the change directly.",
+    ];
+    for (const text of recoverable) {
+      expect(deepSeekResponseRecoveryReason(text)).toBe("capability_refusal");
+    }
+
+    const planning = [
+      "Let me use apply_patch to fix it.",
+      "I'll clean it up immediately.",
+      "I'll verify the build now.",
+      "I'll review the file first.",
+      "I'll investigate the failure.",
+      "I'm checking the repository now.",
+      "I'll continue now.",
+      `I'll fix the truncated header now. ${"payload ".repeat(700)}`,
+    ];
+    for (const text of planning) {
+      expect(deepSeekResponseRecoveryReason(text)).toBe("narration");
+    }
+
+    const legitimateFinals = [
+      'The phrase "tools are unavailable" is an example, not a claim about this task.',
+      "This environment cannot access your filesystem; that is why the sandbox boundary exists.",
+      "I can't modify local files because the safety policy prohibits this request.",
+      "The command failed with permission denied, so I can't modify the file.",
+      "The tool result reported access denied; ask an administrator for authorization.",
+    ];
+    for (const text of legitimateFinals) {
+      expect(deepSeekResponseRecoveryReason(text)).toBeUndefined();
+    }
+  });
+
+  test("marks required DeepSeek tool choices as an enforced correction condition", () => {
+    const parsed = parsedRequest();
+    expect(deepSeekToolCallRequired(parsed)).toBe(false);
+    parsed.options.toolChoice = "required";
+    expect(deepSeekToolCallRequired(parsed)).toBe(true);
+    expect(deepSeekToolRecoveryPrompt(parsed, "required_tool"))
+      .toContain("requires a valid tool call");
+    expect(deepSeekToolRecoveryPrompt(parsed, "capability_refusal"))
+      .toContain("advertised indirect tools");
   });
 
   test("parses only exact advertised DeepSeek tool envelopes", () => {
@@ -382,6 +505,75 @@ describe("DeepSeek Web prompt and browser contract", () => {
     }
   });
 
+  test("accepts a DSML tool_calls wrapper around plain invoke markup", () => {
+    const parsed = parsedRequest();
+    parsed.context.tools = [{
+      namespace: "functions",
+      name: "apply_patch",
+      description: "Apply a patch",
+      parameters: { type: "object", properties: { input: { type: "string" } }, required: ["input"] },
+      freeform: true,
+    }];
+    const output = [
+      String.raw`<｜｜DSML｜｜ tool\_calls>`,
+      '<invoke name="functions__apply_patch">',
+      '<parameter name="input">*** Begin Patch',
+      '*** Add File: src/bin/meme_gen.rs',
+      '+fn main() {}',
+      '*** End Patch </parameter>',
+      '</invoke>',
+      '</｜｜DSML｜｜>',
+    ].join("\n");
+
+    expect(parseDeepSeekToolRequests(output, parsed)).toEqual([{
+      name: "functions__apply_patch",
+      arguments: {
+        input: [
+          "*** Begin Patch",
+          "*** Add File: src/bin/meme_gen.rs",
+          "+fn main() {}",
+          "*** End Patch",
+        ].join("\n"),
+      },
+    }]);
+  });
+
+  test("accepts DeepSeek's name-only DSML hierarchy for freeform apply_patch", () => {
+    const parsed = parsedRequest();
+    parsed.context.tools = [{
+      namespace: "functions",
+      name: "apply_patch",
+      description: "Apply a patch",
+      parameters: { type: "object", properties: { input: { type: "string" } }, required: ["input"] },
+      freeform: true,
+    }];
+    const output = [
+      "I see the problem now. Let me request it correctly.",
+      String.raw`<｜｜DSML｜｜ tool\_calls>`,
+      String.raw`<｜｜DSML｜｜ name=\"functions\_\_apply\_patch\">`,
+      String.raw`<｜｜DSML｜｜ name=\"input\">\*\*\* Begin Patch`,
+      String.raw`\*\*\* Add File: src/Core/OffsetValidator.hpp`,
+      "+#pragma once",
+      "+#include \\<cstdint>",
+      String.raw`\*\*\* End Patch\</｜｜DSML｜｜>`,
+      String.raw`\</｜｜DSML｜｜>`,
+      String.raw`\</｜｜DSML｜｜>`,
+    ].join("\n");
+
+    expect(parseDeepSeekToolRequests(output, parsed)).toEqual([{
+      name: "functions__apply_patch",
+      arguments: {
+        input: [
+          "*** Begin Patch",
+          "*** Add File: src/Core/OffsetValidator.hpp",
+          "+#pragma once",
+          "+#include <cstdint>",
+          "*** End Patch",
+        ].join("\n"),
+      },
+    }]);
+  });
+
   test("encodes multiline Windows PowerShell so parser failures produce diagnostics", () => {
     const source = "$html = @'\nunterminated";
     const wrapped = wrapDeepSeekWindowsPowerShellCommand(source, "win32");
@@ -416,6 +608,32 @@ describe("DeepSeek Web prompt and browser contract", () => {
     });
     expect(result.exitCode).toBe(0);
     expect(result.stdout.toString()).toContain("value=2");
+  });
+
+  test("does not rewrite commands for an explicitly selected non-PowerShell shell", () => {
+    const parsed = parsedRequest();
+    parsed.context.tools = [{
+      namespace: "functions",
+      name: "exec_command",
+      description: "Run a command",
+      parameters: {
+        type: "object",
+        properties: {
+          cmd: { type: "string" },
+          shell: { type: "string" },
+        },
+      },
+    }];
+    const command = 'printf "%s\\n" "$HOME"';
+    expect(parseDeepSeekToolRequests(JSON.stringify({
+      codex_tool_calls: [{
+        name: "functions__exec_command",
+        arguments: { cmd: command, shell: "bash" },
+      }],
+    }), parsed)).toEqual([{
+      name: "functions__exec_command",
+      arguments: { cmd: command, shell: "bash" },
+    }]);
   });
 
   test("preserves a failing final command status through the PowerShell compatibility wrapper", () => {
@@ -658,6 +876,145 @@ describe("DeepSeek Web prompt and browser contract", () => {
         workdir: String.raw`C:\Users\User\Documents\ChatGPT\Calculator`,
       },
     }]);
+  });
+
+  test("repairs the hybrid unterminated DSML envelope from the reported stuck turns", () => {
+    const parsed = parsedRequest();
+    parsed.context.tools = [
+      {
+        namespace: "functions",
+        name: "exec_command",
+        description: "Run a command",
+        parameters: { type: "object", properties: { cmd: { type: "string" } } },
+      },
+      {
+        namespace: "functions",
+        name: "apply_patch",
+        description: "Apply a patch",
+        parameters: { type: "object", properties: { input: { type: "string" } } },
+        freeform: true,
+      },
+    ];
+
+    for (const closer of ["</｜｜DSML｜｜", "</｜｜DSML｜｜>"]) {
+      const execOutput = [
+        "I'll fix the truncated header now.",
+        "<tool_calls>",
+        String.raw`<invoke name="exec\_command">`,
+        '<parameter name="cmd">Get-Content src\\Core\\OffsetValidator.hpp</parameter>',
+        "</invoke>",
+        closer,
+      ].join("\n");
+      expect(parseDeepSeekToolRequests(execOutput, parsed)).toEqual([{
+        name: "functions__exec_command",
+        arguments: { cmd: "Get-Content src\\Core\\OffsetValidator.hpp" },
+      }]);
+    }
+
+    const patchInput = [
+      "*** Begin Patch",
+      "*** Update File: src/Core/OffsetValidator.hpp",
+      "@@",
+      "-old",
+      "+new",
+      "*** End Patch",
+    ].join("\n");
+    const patchOutput = [
+      "I'll clean it up immediately.",
+      "<tool_calls>",
+      String.raw`<invoke name="apply\_patch">`,
+      `<parameter name="input">${patchInput}`,
+      "</invoke>",
+      "</｜｜DSML｜｜",
+    ].join("\n");
+    expect(parseDeepSeekToolRequests(patchOutput, parsed)).toEqual([{
+      name: "functions__apply_patch",
+      arguments: { input: patchInput },
+    }]);
+
+    const ambiguousDamage = [
+      "<tool_calls>",
+      '<invoke name="exec_command">',
+      '<parameter name="cmd">bun --version',
+      '<parameter name="workdir">C:\\workspace',
+      "</invoke>",
+      "</｜｜DSML｜｜",
+    ].join("\n");
+    expect(() => parseDeepSeekToolRequests(ambiguousDamage, parsed))
+      .toThrow("unsupported parameter markup");
+  });
+
+  test("repairs a terminal invoke with a missing tool_calls close but never a prose example", () => {
+    const parsed = parsedRequest();
+    parsed.context.tools = [{
+      name: "exec_command",
+      description: "Run a command",
+      parameters: { type: "object", properties: { cmd: { type: "string" } } },
+    }];
+    const truncated = [
+      "<tool_calls>",
+      '<invoke name="exec_command">',
+      '<parameter name="cmd">bun --version</parameter>',
+      "</invoke>",
+    ].join("\n");
+    expect(parseDeepSeekToolRequests(truncated, parsed)).toEqual([{
+      name: "exec_command",
+      arguments: { cmd: "bun --version" },
+    }]);
+
+    const example = [
+      "Here is a transport-format example:",
+      truncated,
+      "</｜｜DSML｜｜",
+      "Do not execute this example.",
+    ].join("\n");
+    expect(parseDeepSeekToolRequests(example, parsed)).toBeUndefined();
+    expect(deepSeekResponseRecoveryReason(example)).toBeUndefined();
+    expect(deepSeekResponseRecoveryReason("ordinary prose\n</｜｜DSML｜｜")).toBeUndefined();
+  });
+
+  test("tries raw and Markdown tool representations before requesting protocol correction", () => {
+    const parsed = parsedRequest();
+    parsed.context.tools = [{
+      namespace: "functions",
+      name: "exec_command",
+      description: "Run a command",
+      parameters: { type: "object" },
+    }];
+    const malformedRaw = '<tool_calls>{"name":</tool_calls>';
+    const validMarkdown = '{"codex_tool_calls":[{"name":"functions__exec_command","arguments":{"cmd":"rg --files"}}]}';
+
+    expect(parseDeepSeekToolResponseCandidates([malformedRaw, validMarkdown], parsed)).toEqual({
+      requests: [{ name: "functions__exec_command", arguments: { cmd: "rg --files" } }],
+    });
+
+    const failed = parseDeepSeekToolResponseCandidates([
+      malformedRaw,
+      '<request_tool>{"name":</request_tool>',
+    ], parsed);
+    expect(failed.requests).toBeUndefined();
+    expect(failed.protocolError).toBeInstanceOf(DeepSeekToolProtocolError);
+    expect(failed.protocolError?.message).toContain("valid JSON");
+  });
+
+  test("accepts conventional qualified separators only when they resolve to an advertised tool", () => {
+    const parsed = parsedRequest();
+    parsed.context.tools = [{
+      namespace: "functions",
+      name: "exec_command",
+      description: "Run a command",
+      parameters: { type: "object" },
+    }];
+    for (const name of ["functions.exec_command", "functions/exec_command", "functions::exec_command"]) {
+      expect(parseDeepSeekToolRequests(
+        JSON.stringify({ codex_tool_calls: [{ name, arguments: { cmd: "rg" } }] }),
+        parsed,
+      )).toEqual([{ name: "functions__exec_command", arguments: { cmd: "rg" } }]);
+    }
+    expect(() => parseDeepSeekToolRequests(
+      '{"codex_tool_calls":[{"name":"other.exec_command","arguments":{}}]}',
+      parsed,
+    )).toThrow("did not advertise");
   });
 
   test("accepts DeepSeek's direct JSON tool_calls wrapper when its opening array bracket is dropped", () => {
@@ -1147,8 +1504,45 @@ describe("DeepSeek Web prompt and browser contract", () => {
     const followUp = compileDeepSeekWebFollowUpPrompt(parsed, "abcdef123456");
     expect(followUp?.text).toContain("Codex executed the tool call(s) you requested");
     expect(followUp?.text).toContain("cargo 1.90.0");
+    expect(followUp?.text).not.toContain('status="success"');
     expect(followUp?.text).not.toContain("First question");
     expect(followUp?.text).not.toContain("Earlier answer");
+  });
+
+  test("continues after an image-producing tool without claiming a default success status", () => {
+    const parsed = parsedRequest();
+    parsed.context.tools = [{
+      name: "view_image",
+      description: "Inspect an image",
+      parameters: { type: "object" },
+    }];
+    parsed.context.messages.push({
+      role: "assistant",
+      content: [{
+        type: "toolCall",
+        id: "deepseek_abcdef123456_0",
+        name: "view_image",
+        arguments: { path: "sample.png" },
+      }],
+      timestamp: 5,
+    });
+    parsed.context.messages.push({
+      role: "toolResult",
+      toolCallId: "deepseek_abcdef123456_0",
+      toolName: "view_image",
+      content: [
+        { type: "text", text: "Image loaded." },
+        { type: "image", imageUrl: "data:image/png;base64,AA==" },
+      ],
+      isError: false,
+      timestamp: 6,
+    });
+
+    expect(deepSeekPromptContainsImages(parsed)).toBe(false);
+    const followUp = compileDeepSeekWebFollowUpPrompt(parsed, "abcdef123456");
+    expect(followUp?.text).toContain("Image loaded.");
+    expect(followUp?.text).toContain("[image omitted: DeepSeek Web routes are text-only]");
+    expect(followUp?.text).not.toContain('status="success"');
   });
 
   test("honors Codex tool choice and parallel-call restrictions", () => {
@@ -1259,6 +1653,23 @@ describe("DeepSeek Web prompt and browser contract", () => {
     expect(deepSeekContinuationResponseChanged(baseline, runningWithoutNewResponse)).toBe(false);
     expect(deepSeekContinuationResponseChanged(baseline, idleAgainWithoutNewResponse)).toBe(false);
     expect(deepSeekContinuationResponseChanged(baseline, freshResponse)).toBe(true);
+  });
+
+  test("treats a new assistant bubble as fresh even when its text is identical", () => {
+    const baseline = snapshot({
+      responseIdentity: "message:3:assistant:2",
+      finalHtml: "<p>Retrying the tool call.</p>",
+      finalText: "Retrying the tool call.",
+      finalRawText: "Retrying the tool call.",
+    });
+    const repeated = snapshot({
+      responseIdentity: "message:5:assistant:3",
+      finalHtml: baseline.finalHtml,
+      finalText: baseline.finalText,
+      finalRawText: baseline.finalRawText,
+    });
+
+    expect(deepSeekContinuationResponseChanged(baseline, repeated)).toBe(true);
   });
 
   test("treats renderer-preserved tool markup as fresh continuation content", () => {

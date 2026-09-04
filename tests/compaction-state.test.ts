@@ -363,6 +363,30 @@ describe("ChatGPT Web compaction continuation", () => {
     expect(cancelled).toEqual(["a0", "a1", "b0", "a2"]);
   });
 
+  test("keeps an active browser session alive across arbitrary time beyond settled-cache retention", () => {
+    let now = 1_000;
+    let starts = 0;
+    const cancelled: string[] = [];
+    const sessions = new ChatGptTurnSessions(5 * 60_000, 256, () => now);
+    const start = () => {
+      starts += 1;
+      return pendingReadOnlyRuntime(() => cancelled.push("active"));
+    };
+
+    const initial = sessions.getOrCreate("long-running", start, "long-running-family");
+    now += 31 * 60_000;
+    const thirtyMinuteReplay = sessions.getOrCreate("long-running", start, "long-running-family");
+    now += 1_000 * 365 * 24 * 60 * 60_000;
+    const thousandYearReplay = sessions.getOrCreate("long-running", start, "long-running-family");
+
+    expect(thirtyMinuteReplay).toBe(initial);
+    expect(thousandYearReplay).toBe(initial);
+    expect(sessions.activeCount()).toBe(1);
+    expect(starts).toBe(1);
+    expect(cancelled).toEqual([]);
+    sessions.clear();
+  });
+
   test("cancelling a superseded turn releases the serialized BrowserWorker tail", async () => {
     const worker = Object.create(ChatGptBrowserWorker.prototype) as ChatGptBrowserWorker & Record<string, unknown>;
     (worker as any).tail = Promise.resolve();

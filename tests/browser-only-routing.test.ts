@@ -25,6 +25,7 @@ const nativeTemplate = {
     context_window: 256_000,
     max_context_window: 256_000,
     auto_compact_token_limit: 220_000,
+    tool_mode: "code_mode_only",
     comp_hash: "native-only-hash",
     supported_reasoning_levels: [{ effort: "high", description: "High" }],
   }, {
@@ -76,14 +77,18 @@ describe("browser-only native routing guard", () => {
     });
   });
 
-  test("keeps native GPT-5.6 Sol and ChatGPT Web models in full mode when DeepSeek is enabled", () => {
+  test("keeps native models while DeepSeek does not inherit code-mode-only routing in full mode", () => {
     const catalog = augmentNativeModelCatalog(nativeTemplate, config("full", true));
-    const slugs = (catalog.models as Array<{ slug: string }>).map(model => model.slug);
+    const models = catalog.models as Array<Record<string, unknown>>;
+    const slugs = models.map(model => model.slug);
 
     expect(slugs).toContain("gpt-5.6-sol");
     expect(slugs).toContain("chatgpt-web/high");
     expect(slugs).toContain("deepseek-web/instant");
     expect(slugs).toContain("deepseek-web/expert");
+    expect(models.find(model => model.slug === "gpt-5.6-sol")?.tool_mode).toBe("code_mode_only");
+    expect(models.find(model => model.slug === "deepseek-web/instant")?.tool_mode).toBeNull();
+    expect(models.find(model => model.slug === "deepseek-web/expert")?.tool_mode).toBeNull();
   });
 
   test("keeps native context boundaries so Codex can compact web-model history", () => {
