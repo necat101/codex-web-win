@@ -12,7 +12,7 @@ import { TurnBroker, type BrokerToolRequest, type BrokerToolResult } from "./tur
 import { ChatGptHeartbeatFeed, ChatGptTextFeed, ChatGptTraceFeed, chatGptTurnExecutionFamilyKey, chatGptTurnExecutionKey, chatGptTurnSessions, type ChatGptBrowserOutcome, type ChatGptTraceEvent, type ChatGptTurnRuntime, type ChatGptTurnSession } from "./turn-execution";
 import { estimateChatGptWebUsage } from "./usage";
 import { sharedChatGptThreadEnvironmentStore } from "./thread-environment";
-const CHATGPT_POST_TOOL_YIELD_MS = 650;
+const CHATGPT_PRE_TOOL_TRACE_GRACE_MS = 900;
 
 function brokerSocketPath(provider: CodexProviderConfig): string {
   return resolveBrokerSocketPath(provider.chatgptWeb?.brokerSocketPath);
@@ -515,15 +515,6 @@ export function createChatGptWebAdapter(provider: CodexProviderConfig): Provider
                 return;
               }
 
-              // The broker completions above have already returned the real
-              // local results to ChatGPT. Pause only before accepting a NEW
-              // substantive batch so the browser model gets an old-style
-              // continuation/commentary opportunity instead of immediately
-              // disappearing into another silent tool round.
-              console.info(
-                "[chatgpt-web] completed Codex tool batch; yielding to ChatGPT for visible commentary before the next tool batch",
-              );
-              await new Promise(resolveYield => setTimeout(resolveYield, CHATGPT_POST_TOOL_YIELD_MS));
             }
           } else if (session.outstanding().length > 0) {
             throw new Error("Read-only ChatGPT Web runtime cannot own local tool calls");
@@ -536,9 +527,6 @@ export function createChatGptWebAdapter(provider: CodexProviderConfig): Provider
             const emitNewText = (deltas: string[]) => appendTextToActiveRound(session, deltas, emit);
             emitNewTrace(session.runtime.trace.drain());
             emitNewText(session.runtime.text.drain());
-            if (session.runtime.mode === "tools") {
-              console.info("[chatgpt-web] draining browser continuation after tool-result yield");
-            }
             const stagedTools = session.stagedTools();
             const nextTools = turnToken
               ? stagedTools.length > 0
@@ -609,6 +597,24 @@ export function createChatGptWebAdapter(provider: CodexProviderConfig): Provider
               if (!turnToken || session.runtime.mode !== "tools") {
                 throw new Error("Read-only ChatGPT Web runtime received a broker tool batch");
               }
+              // The broker can receive a tool request a few milliseconds before
+              // Playwright has published the Markdown commentary that preceded
+              // it. Give the browser's forced 0 -> pending trace snapshot a
+              // short bounded chance to land, then drain it before emitting the
+              // tool cell. This replaces the old post-result sleep, which added
+              // latency but did not actually prevent silent tool chaining.
+              const alreadyHasCommentary = session.eventsForActiveRoundReplay().some(event => (
+                event.type === "text_delta"
+                && event.phase === "commentary"
+                && event.text.trim().length > 0
+              ));
+              if (!alreadyHasCommentary) {
+                await withAbort(
+                  new Promise(resolveGrace => setTimeout(resolveGrace, CHATGPT_PRE_TOOL_TRACE_GRACE_MS)),
+                  incoming.abortSignal,
+                );
+              }
+              emitNewTrace(session.runtime.trace.drain());
               const requests = session.takeStagedToolBatch();
               if (requests.length === 0) throw new Error("ChatGPT tool bridge returned an empty batch");
               validateBatchTools(effectiveTools, requests);

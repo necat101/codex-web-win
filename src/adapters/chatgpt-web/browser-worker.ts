@@ -489,7 +489,12 @@ export class ChatGptVisibleTraceTracker {
 
   constructor(private readonly commentaryStabilityMs = 1_000) {}
 
-  observe(blocks: ChatGptVisibleTraceBlock[], completionActionPresent: boolean, now = Date.now()): ChatGptVisibleTraceEvent[] {
+  observe(
+    blocks: ChatGptVisibleTraceBlock[],
+    completionActionPresent: boolean,
+    now = Date.now(),
+    pendingToolCount = 0,
+  ): ChatGptVisibleTraceEvent[] {
     let lastMarkdown = -1;
     for (let index = 0; index < blocks.length; index++) {
       if (blocks[index]!.kind === "markdown") lastMarkdown = index;
@@ -512,7 +517,8 @@ export class ChatGptVisibleTraceTracker {
       if (!text) continue;
       // The trailing Markdown root is ambiguous while running and becomes the final answer once
       // complete. It stays owned by ChatGptMarkdownStream; earlier roots are stable commentary.
-      if (block.kind === "markdown"
+      if (pendingToolCount === 0
+        && block.kind === "markdown"
         && (completionActionPresent ? index === lastMarkdown : index === blocks.length - 1)) {
         continue;
       }
@@ -3179,6 +3185,34 @@ export class ChatGptBrowserWorker {
           : 0;
         if (pendingToolCount > 0) {
           completionTracker.reset();
+          if (previousPendingToolCount === 0) {
+            // A tool invocation can arrive immediately after a short Markdown
+            // progress message. The normal pending-tool fast path used to skip
+            // DOM/trace inspection entirely, so that commentary was never
+            // surfaced to Codex before the tool cell. Capture exactly one trace
+            // snapshot on the 0 -> pending transition. While a tool is pending,
+            // the trailing Markdown root cannot be a completed final answer, so
+            // the tracker may safely classify it as commentary.
+            const traceSnapshot = await this.responseDomSnapshot(
+              page,
+              initialResponseTurnCount,
+              false,
+              true,
+            );
+            if (traceSnapshot.responsePresent) {
+              const transitionTrace = visibleTrace.observe(
+                traceSnapshot.traceBlocks,
+                traceSnapshot.completionActionPresent,
+                Date.now(),
+                pendingToolCount,
+              );
+              if (transitionTrace.length > 0) recordActivity();
+              for (const trace of transitionTrace) {
+                if (trace.kind === "commentary") turn.onCommentary?.(trace.text, trace.continuation === true);
+                else turn.onReasoningSummary?.(trace.text);
+              }
+            }
+          }
           if (pendingToolCount !== previousPendingToolCount) recordActivity();
           await rendererTelemetry?.sample(
             previousPendingToolCount > 0 ? "tool-wait" : "tool-wait-start",

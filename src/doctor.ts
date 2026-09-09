@@ -96,6 +96,23 @@ export async function runDoctor(): Promise<DoctorReport> {
   } else {
     checks.push({ id: "chrome", status: "ok", message: `Chrome executable found: ${config.chromeExecutablePath}` });
   }
+  const ffmpegPath = Bun.which("ffmpeg");
+  const ffprobePath = Bun.which("ffprobe");
+  if (ffmpegPath && ffprobePath) {
+    checks.push({
+      id: "media-tools",
+      status: "ok",
+      message: "FFmpeg media inspection tools are available",
+      detail: `ffmpeg=${ffmpegPath}; ffprobe=${ffprobePath}`,
+    });
+  } else {
+    checks.push({
+      id: "media-tools",
+      status: "warning",
+      message: "FFmpeg media inspection tools are not fully available on PATH",
+      detail: "Local video/audio inspection through Codex can use ffmpeg/ffprobe when installed. Install FFmpeg, ensure both executables are on PATH, then restart the Codex ChatGPT Web session. A missing binary is a dependency issue, not a harness permission denial.",
+    });
+  }
   if (!browserLoginStateExists(config)) {
     checks.push({ id: "login", status: "error", message: "ChatGPT login state is missing or unverified; run `codex-chatgpt-web login`" });
   } else if (!secureFile(config.storageStatePath)) {

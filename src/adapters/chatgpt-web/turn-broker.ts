@@ -3,6 +3,7 @@ import { chmodSync, existsSync, lstatSync, mkdirSync, unlinkSync } from "node:fs
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { dirname } from "node:path";
 import { isWindowsNamedPipePath, resolveBrokerSocketPath } from "../../config";
+import type { CodexTool } from "../../types";
 import type { ChatGptTurnEnvironment } from "./environment";
 
 export interface BrokerToolRequest {
@@ -95,6 +96,51 @@ function environmentIdentity(environment: ChatGptTurnEnvironment): string {
   });
 }
 
+function toolIdentity(tool: Pick<CodexTool, "name" | "namespace">): string {
+  return `${tool.namespace ?? ""}\u0000${tool.name}`;
+}
+
+function isStableTurnExecutionTool(tool: CodexTool): boolean {
+  if (tool.namespace && tool.namespace !== "functions") return false;
+  if (tool.name === "exec") return tool.freeform === true;
+  return tool.freeform !== true
+    && (tool.name === "exec_command"
+      || tool.name === "shell_command"
+      || tool.name === "write_stdin"
+      || tool.name === "wait");
+}
+
+/**
+ * A claimed turn binding is the capability grant for that native Codex turn.
+ * Continuation requests sometimes arrive with a transiently incomplete tool
+ * registry (notably while the Windows exec gateway/plugin registry is being
+ * refreshed). Treating that sample as authoritative used to make a working
+ * exec_command/apply_patch capability disappear immediately before a later
+ * build step.
+ *
+ * Keep only the native command path already advertised for the lifetime of the
+ * binding. A later continuation may refresh those definitions or add/remove
+ * unrelated tools normally, but a transient registry sample cannot strand an
+ * in-flight command or its resumable session. Filesystem and sandbox authority
+ * are still checked separately by environmentIdentity().
+ */
+export function mergeStableTurnTools(previous: readonly CodexTool[], refreshed: readonly CodexTool[]): CodexTool[] {
+  const remaining = new Map(refreshed.map(tool => [toolIdentity(tool), tool]));
+  const merged: CodexTool[] = [];
+  for (const prior of previous) {
+    const identity = toolIdentity(prior);
+    const current = remaining.get(identity);
+    if (current) {
+      merged.push(current);
+      remaining.delete(identity);
+    } else if (isStableTurnExecutionTool(prior)) {
+      merged.push(prior);
+    }
+  }
+  merged.push(...remaining.values());
+  return merged;
+}
+
 export class TurnBroker {
   static forSocket(path: string): TurnBroker {
     const endpoint = resolveBrokerSocketPath(path);
@@ -136,7 +182,10 @@ export class TurnBroker {
     if (environmentIdentity(channel.environment) !== environmentIdentity(environment)) {
       throw new Error("Codex turn environment changed during an active ChatGPT tool loop");
     }
-    channel.environment = { ...environment };
+    channel.environment = {
+      ...environment,
+      tools: mergeStableTurnTools(channel.environment.tools, environment.tools),
+    };
     return channel.environment;
   }
 
