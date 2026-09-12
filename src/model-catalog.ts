@@ -59,6 +59,7 @@ export function buildChatGptWebModel(
     tool_mode: config.mode === "full" && !route.requiresPro ? template.tool_mode : null,
     upgrade: null,
     default_reasoning_level: route.codexEffort,
+    supports_reasoning_summaries: true,
     supported_reasoning_levels: [reasoningLevel(template, route.codexEffort, route.displayName)],
     // ChatGPT Web has no Codex service tier. Never inherit the native template's Fast tiers.
     additional_speed_tiers: [],

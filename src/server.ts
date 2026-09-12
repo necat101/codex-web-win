@@ -763,7 +763,9 @@ export async function startServer(
   });
   // Browser turns can run for tens of minutes. Keep header parsing bounded while
   // disabling request and socket inactivity deadlines for active SSE streams.
-  server.headersTimeout = 60_000;
+  // SSE turns can legitimately spend a long time in reasoning/tool execution.
+  // Keep the connection alive while the active request owns the stream.
+  server.headersTimeout = 0;
   server.requestTimeout = 0;
   server.timeout = 0;
   server.keepAliveTimeout = 5_000;

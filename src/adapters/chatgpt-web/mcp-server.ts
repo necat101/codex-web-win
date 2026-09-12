@@ -273,7 +273,17 @@ export function shellCommandInvocationArgs(options: {
   // inherit a very short native timeout, which makes healthy builds look frozen
   // or fail at roughly the requested yield interval. Use the bridge's maximum
   // command budget unless the caller explicitly supplied a hard deadline.
-  const timeoutMs = options.timeoutMs ?? 300_000;
+  // Windows packaging/build tasks frequently exceed the old five minute bridge
+  // budget. Keep yield_time_ms as a UI responsiveness hint, but give the actual
+  // command enough lifetime to finish and return its result.
+  // Zero means "no bridge-imposed deadline" for native shell execution. The
+  // underlying command runner still owns process failures and explicit aborts;
+  // this layer must not kill long builds, packaging jobs, or model-driven tasks.
+  // Native command execution is allowed to own its lifetime. The MCP bridge
+  // should not silently kill builds, packaging, training, or long-running
+  // local jobs because a transport default expired. Explicit timeout_ms still
+  // remains available when a caller wants a deadline.
+  const timeoutMs = options.timeoutMs ?? 0;
   return {
     command: options.cmd,
     ...(options.workdir ? { workdir: options.workdir } : {}),
@@ -786,7 +796,14 @@ export async function runChatGptMcpServer(options: { brokerSocketPath: string })
         cmd: z.string().min(1).max(100_000),
         workdir: z.string().max(16_384).optional(),
         yield_time_ms: z.number().int().min(250).max(30_000).optional(),
-        timeout_ms: z.number().int().min(1_000).max(300_000).optional(),
+        // Allow long-running local builds/training jobs without forcing the
+        // browser bridge to kill a healthy execution window. This is still a
+        // bounded safety valve; callers can omit it to use the runtime default.
+        // Tool execution can legitimately outlive a normal HTTP request when a
+        // Codex task is compiling, training, packaging, or waiting on a native
+        // build. The native command layer owns cancellation; this bridge should
+        // not impose an artificial one-day ceiling.
+        timeout_ms: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).optional(),
         max_output_tokens: z.number().int().min(1).max(1_000_000).optional(),
         tty: z.boolean().optional(),
       },

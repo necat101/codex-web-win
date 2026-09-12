@@ -166,7 +166,7 @@ export function compileChatGptWebPrompt(
   const text = [
     ...sharedContract,
     ...transportContract,
-    "Return only the answer that the outer Codex task should receive.",
+    "Send task-facing progress commentary while working and a final answer when finished. Omit transport chatter.",
     ...contextTransport,
     ...transportResume,
   ].join("\n");

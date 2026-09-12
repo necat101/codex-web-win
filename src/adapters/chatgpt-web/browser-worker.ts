@@ -7,6 +7,7 @@ import type { CodexProviderConfig } from "../../types";
 import { browserComposerTextMatches, normalizeBrowserComposerText } from "../composer-text";
 import { parseDataUrl } from "../image";
 import { ChatGptMarkdownStream } from "./markdown";
+import { ChatGptBrowserEventStream, ChatGptStreamDiagnostics } from "./event-stream";
 import { resolveChatGptWebModelMode, type ChatGptWebCapabilities, type ChatGptWebModelMode } from "./model";
 import { CHATGPT_INTERNAL_COMPACTION_MARKER, containsChatGptCompactionMarker, stripChatGptTransportMarkers, type CompiledChatGptWebPrompt, type ChatGptWebPromptImage } from "./prompt";
 import { estimateCompiledChatGptWebInputTokens } from "./usage";
@@ -2585,8 +2586,8 @@ export class ChatGptBrowserWorker {
     initialUserTurns: number,
     initialAssistantTurns: number,
   ): Promise<ChatGptSubmissionState> {
-    const userTurns = page.locator('section[data-testid^="conversation-turn-"][data-turn="user"]');
-    const assistantTurns = page.locator('section[data-testid^="conversation-turn-"][data-turn="assistant"]');
+    const userTurns = page.locator('[data-testid^="conversation-turn-"][data-turn="user"]');
+    const assistantTurns = page.locator('[data-testid^="conversation-turn-"][data-turn="assistant"]');
     const composer = page.getByRole("textbox", { name: "Chat with ChatGPT" });
     const composerPresent = await composer.count().catch(() => 0) > 0;
     const composerHasUserText = composerPresent
@@ -2782,8 +2783,9 @@ export class ChatGptBrowserWorker {
     responseIndex: number,
     scanRecoverySignals: boolean,
     scanTraceBlocks: boolean,
+    pendingToolCount = 0,
   ): Promise<ChatGptResponseDomSnapshot> {
-    const snapshot = await page.evaluate(({ maxTraceCandidates, responseIndex, scanRecoverySignals, scanTraceBlocks }) => {
+    const snapshot = await page.evaluate(({ maxTraceCandidates, responseIndex, scanRecoverySignals, scanTraceBlocks, pendingToolCount }) => {
       const visible = (candidate: HTMLElement): boolean => {
         if (typeof candidate.checkVisibility === "function") {
           return candidate.checkVisibility({
@@ -2835,7 +2837,7 @@ export class ChatGptBrowserWorker {
       }
 
       const root = document.querySelectorAll<HTMLElement>(
-        'section[data-testid^="conversation-turn-"][data-turn="assistant"]',
+        '[data-testid^="conversation-turn-"][data-turn="assistant"]',
       )[responseIndex];
       if (!root) {
         return {
@@ -2920,7 +2922,7 @@ export class ChatGptBrowserWorker {
             // tracker intentionally never emits it, so do not serialize its full
             // text across the Playwright boundary on every poll. Keep an empty
             // sentinel so tracker ordering/"last markdown" semantics stay exact.
-            text: candidate === rendered ? "" : (candidate.textContent ?? "").trim(),
+            text: candidate === rendered && pendingToolCount === 0 ? "" : (candidate.textContent ?? "").trim(),
             finalAnswer: candidate === rendered,
           }))
           .filter(block => block.finalAnswer || block.text.length > 0)
@@ -2954,6 +2956,7 @@ export class ChatGptBrowserWorker {
       responseIndex,
       scanRecoverySignals,
       scanTraceBlocks,
+      pendingToolCount,
     }).then(value => ({ ...value, probeSucceeded: true } satisfies ChatGptResponseDomSnapshot))
       .catch(() => absentResponseDomSnapshot(false));
     snapshot.traceBlocks = snapshot.traceBlocks.filter(block => !isChatGptTraceControl(block));
@@ -2963,7 +2966,7 @@ export class ChatGptBrowserWorker {
   private async finalResponseHtml(page: Page, responseIndex: number): Promise<string | undefined> {
     return page.evaluate(responseIndex => {
       const root = document.querySelectorAll<HTMLElement>(
-        'section[data-testid^="conversation-turn-"][data-turn="assistant"]',
+        '[data-testid^="conversation-turn-"][data-turn="assistant"]',
       )[responseIndex];
       if (!root) return undefined;
       const markdown = root.querySelectorAll<HTMLElement>(".markdown");
@@ -3020,6 +3023,8 @@ export class ChatGptBrowserWorker {
     if (turn.abortSignal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
     const prepared = await turn.prepare();
     let rendererTelemetry: ChatGptRendererTelemetry | undefined;
+    let eventStream: ChatGptBrowserEventStream | undefined;
+    const diagnostics = new ChatGptStreamDiagnostics(turn.traceId);
     try {
       if (turn.abortSignal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
       const estimatedInputTokens = estimateCompiledChatGptWebInputTokens(prepared, turn.modelId);
@@ -3029,6 +3034,19 @@ export class ChatGptBrowserWorker {
       const recordActivity = () => {
         deadline = Date.now() + inactivityBudgetMs;
         schedulerGapExtensionRemainingMs = CHATGPT_MAX_SCHEDULER_GAP_EXTENSION_MS;
+      };
+      const traceSources = new Map<string, "dom" | "sse">();
+      const emitTrace = (trace: ChatGptVisibleTraceEvent, source: "dom" | "sse") => {
+        diagnostics.count(`${source}_${trace.kind}_observed`);
+        const owner = traceSources.get(trace.kind);
+        if (owner && owner !== source) return;
+        traceSources.set(trace.kind, source);
+        const text = stripChatGptTransportMarkers(trace.text);
+        if (!text) return;
+        recordActivity();
+        if (trace.kind === "commentary") turn.onCommentary?.(text, trace.continuation === true);
+        else turn.onReasoningSummary?.(text);
+        diagnostics.count(`forwarded_${trace.kind}_chars`, text.length);
       };
       const page = await this.runStage(
         turn.traceId,
@@ -3096,8 +3114,17 @@ export class ChatGptBrowserWorker {
       await this.runStage(turn.traceId, "file_attachment", browserStageTimeouts.fileAttachment, () => (
         this.attachFiles(page, prepared, turn.abortSignal)
       ), turn.abortSignal);
-      const userTurns = page.locator('section[data-testid^="conversation-turn-"][data-turn="user"]');
-      const responseTurns = page.locator('section[data-testid^="conversation-turn-"][data-turn="assistant"]');
+      const userTurns = page.locator('[data-testid^="conversation-turn-"][data-turn="user"]');
+      const responseTurns = page.locator('[data-testid^="conversation-turn-"][data-turn="assistant"]');
+      eventStream = new ChatGptBrowserEventStream(delta => {
+        if (turn.abortSignal?.aborted) return;
+        if (delta.kind === "final") {
+          recordActivity();
+          turn.onTextDelta(delta.text);
+          diagnostics.count("forwarded_final_chars", delta.text.length);
+        } else emitTrace({ ...delta, kind: delta.kind }, "sse");
+      }, diagnostics);
+      await eventStream.start(page);
       let initialUserTurnCount = 0;
       let initialResponseTurnCount = 0;
       await this.runStage(turn.traceId, "send", browserStageTimeouts.send, async () => {
@@ -3179,13 +3206,14 @@ export class ChatGptBrowserWorker {
         if (Date.now() - lastHeartbeat >= 10_000) {
           turn.onHeartbeat?.();
           lastHeartbeat = Date.now();
+          diagnostics.report();
         }
         const pendingToolCount = mode.localTools
           ? Math.max(0, turn.pendingToolCount?.() ?? 0)
           : 0;
         if (pendingToolCount > 0) {
           completionTracker.reset();
-          if (previousPendingToolCount === 0) {
+          if (previousPendingToolCount === 0 || Date.now() >= nextTraceScanAt) {
             // A tool invocation can arrive immediately after a short Markdown
             // progress message. The normal pending-tool fast path used to skip
             // DOM/trace inspection entirely, so that commentary was never
@@ -3198,7 +3226,9 @@ export class ChatGptBrowserWorker {
               initialResponseTurnCount,
               false,
               true,
+              pendingToolCount,
             );
+            nextTraceScanAt = Date.now() + activePollingProfile.traceMs;
             if (traceSnapshot.responsePresent) {
               const transitionTrace = visibleTrace.observe(
                 traceSnapshot.traceBlocks,
@@ -3208,8 +3238,7 @@ export class ChatGptBrowserWorker {
               );
               if (transitionTrace.length > 0) recordActivity();
               for (const trace of transitionTrace) {
-                if (trace.kind === "commentary") turn.onCommentary?.(trace.text, trace.continuation === true);
-                else turn.onReasoningSummary?.(trace.text);
+                emitTrace(trace, "dom");
               }
             }
           }
@@ -3229,6 +3258,12 @@ export class ChatGptBrowserWorker {
             chatGptResponsePollInterval(pendingToolCount, activePollingProfile.responseMs),
           );
           continue;
+        }
+        // A completed final-channel message is stronger evidence than a Copy
+        // control that may be hidden, remounted, or absent in a new ChatGPT UI.
+        if (eventStream.decoder.finalComplete && eventStream.decoder.finalText) {
+          finalText = eventStream.decoder.finalText;
+          break;
         }
         if (previousPendingToolCount > 0) {
           await rendererTelemetry?.sample("tool-wait-end", 0, true);
@@ -3292,8 +3327,7 @@ export class ChatGptBrowserWorker {
           const newTrace = visibleTrace.observe(snapshot.traceBlocks, snapshot.completionActionPresent);
           if (newTrace.length > 0) recordActivity();
           for (const trace of newTrace) {
-            if (trace.kind === "commentary") turn.onCommentary?.(trace.text, trace.continuation === true);
-            else turn.onReasoningSummary?.(trace.text);
+            emitTrace(trace, "dom");
           }
           const domError = domHealthTracker.update({
             responsePresent: snapshot.responsePresent,
@@ -3329,6 +3363,10 @@ export class ChatGptBrowserWorker {
             if (snapshot.visibleText === "api_tool unavailable") {
               throw new Error("ChatGPT selected mode rejected the Codex Native MCP tool (api_tool unavailable)");
             }
+            if (eventStream.decoder.finalText) {
+              finalText = eventStream.decoder.finalText;
+              break;
+            }
             const finalHtml = await this.finalResponseHtml(page, initialResponseTurnCount);
             const pendingAfterFinalize = mode.localTools
               ? Math.max(0, turn.pendingToolCount?.() ?? 0)
@@ -3350,7 +3388,11 @@ export class ChatGptBrowserWorker {
             if (!final.markdown && snapshot.visibleTextLength > 0) {
               throw new Error("ChatGPT completed with visible text that could not be serialized as Markdown");
             }
-            if (final.delta) turn.onTextDelta(final.delta);
+            if (final.delta) {
+              turn.onTextDelta(final.delta);
+              diagnostics.count("forwarded_final_chars", final.delta.length);
+              diagnostics.count("dom_final_answers");
+            }
             finalText = final.markdown;
             break;
           }
@@ -3404,6 +3446,8 @@ export class ChatGptBrowserWorker {
       console.info(`[chatgpt-web] browser turn ${turn.traceId} completed (markdownChars=${finalText.length})`);
       return finalText;
     } finally {
+      await eventStream?.close();
+      diagnostics.report(true);
       await rendererTelemetry?.close();
       prepared.release();
     }

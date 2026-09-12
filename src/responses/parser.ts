@@ -17,6 +17,7 @@ import { compactionItemToText, isLocalCompactionPromptItem, isReadableCompaction
 import { previousResponseReplayPrefixLength } from "./state";
 import { decodeReasoningEnvelope } from "./reasoning-envelope";
 import { extractHostedWebSearch, WEB_SEARCH_TOOL_NAME } from "../web-search/synthetic-tool";
+import { isChatGptWebModelSlug } from "../chatgpt-web-models";
 
 function isObj(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
@@ -616,7 +617,10 @@ export function parseRequest(body: unknown): CodexParsedRequest {
     options.reasoning = requestedEffort;
   }
   const summaryMode = data.reasoning?.summary;
-  if (!summaryMode || summaryMode === "none") options.hideThinkingSummary = true;
+  // Browser traces are already public summaries. Recent native catalogs may
+  // omit the summary request; that must not silently hide every browser status.
+  // An explicit caller request to hide summaries still takes precedence.
+  if (summaryMode === "none" || (!summaryMode && !isChatGptWebModelSlug(data.model))) options.hideThinkingSummary = true;
   if (data.presence_penalty !== undefined) options.presencePenalty = data.presence_penalty;
   if (data.frequency_penalty !== undefined) options.frequencyPenalty = data.frequency_penalty;
   if (data.service_tier !== undefined) options.serviceTier = data.service_tier;
