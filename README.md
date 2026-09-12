@@ -200,7 +200,8 @@ foreground-owned, so keep the control center open whenever Codex is using the Ch
 5. Under **3. Connection details**, keep the prefilled machine-specific **Connector name** (for
    example, `Codex Native LAPTOP-01`) unless you intend to use a different matching name in ChatGPT.
    The default port and detected Chrome path normally do not need changing. Leave **Automatically click per-call Allow once prompts** off unless you
-   explicitly want the bridge to accept those one-time prompts for you.
+   explicitly want the bridge to accept those one-time prompts for you. When it is off, the bridge keeps the turn open for manual approval and plays
+   a rate-limited reminder sound while **Allow once** remains visible in the controlled Chrome window.
 6. Check the unofficial-software acknowledgement and choose **Set up and sign in**. When the
    dedicated Chrome window opens, sign in to ChatGPT, confirm the composer is visible, then close
    that Chrome window completely. Setup returns you to **Home** when it succeeds.
@@ -303,8 +304,8 @@ Write/modify actions require a ChatGPT workspace and admin policy that permit th
 currently documents those actions for Business and Enterprise/Edu workspaces; personal Pro is
 limited to read/fetch MCP permissions. See
 [developer mode and MCP apps](https://help.openai.com/en/articles/12584461-developer-mode-and-mcp-apps-in-chatgpt).
-Unexpected approval prompts fail closed unless `--auto-approve-tool-calls` is explicitly enabled;
-that option clicks **Allow once**, never a permanent grant.
+Unexpected approval prompts wait for manual confirmation and emit periodic audible reminders unless
+`--auto-approve-tool-calls` is explicitly enabled; that option clicks **Allow once**, never a permanent grant.
 
 ## Operations
 
