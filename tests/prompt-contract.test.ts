@@ -23,6 +23,8 @@ describe("ChatGPT Web transport contract", () => {
 
     expect(compiled.text).toContain("call codex_bind_turn");
     expect(compiled.text).toContain("dangerFullAccess");
+    expect(compiled.text).toContain("only the outer Codex runtime can refuse it");
+    expect(compiled.text).toContain("retry each command separately");
     expect(compiled.text).toContain("codex_tool_inventory");
     expect(compiled.text).toContain("before concluding local command execution is unavailable");
     expect(compiled.text).toContain("__bridge_read_compaction");

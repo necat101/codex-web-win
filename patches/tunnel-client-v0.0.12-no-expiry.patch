@@ -1,0 +1,170 @@
+diff --git a/pkg/dispatcher/internal/processor.go b/pkg/dispatcher/internal/processor.go
+--- a/pkg/dispatcher/internal/processor.go
++++ b/pkg/dispatcher/internal/processor.go
+@@ -180,8 +180,8 @@ func NewProcessor(p processorParams) (*mcpProcessor, error) {
+ 	if p.MCPConfig == nil {
+ 		return nil, fmt.Errorf("dispatcher processor: nil MCP config")
+ 	}
+-	if p.MCPConfig.ConnectionMaxTTL <= 0 {
+-		return nil, fmt.Errorf("dispatcher processor: non-positive MCP connection TTL")
++	if p.MCPConfig.ConnectionMaxTTL < 0 {
++		return nil, fmt.Errorf("dispatcher processor: negative MCP connection TTL")
+ 	}
+ 	if p.ControlPlaneCfg == nil {
+ 		return nil, fmt.Errorf("dispatcher processor: nil control plane config")
+diff --git a/pkg/dispatcher/internal/processor_test.go b/pkg/dispatcher/internal/processor_test.go
+--- a/pkg/dispatcher/internal/processor_test.go
++++ b/pkg/dispatcher/internal/processor_test.go
+@@ -1941,14 +1941,14 @@ func TestNewProcessorValidation(t *testing.T) {
+ 			params: processorParams{Logger: logger, ChannelBindings: newTestChannelBindings(transport), TunnelResponder: responder, MCPConfig: nil, OAuthHTTPClient: validOAuthClient, ControlPlaneCfg: validControlPlane, MeterProvider: meterProvider},
+ 		},
+ 		{
+-			name: "non_positive_ttl",
++			name: "negative_ttl",
+ 			params: processorParams{
+ 				Logger:          logger,
+ 				ChannelBindings: newTestChannelBindings(transport),
+ 				TunnelResponder: responder,
+ 				MCPConfig: func() *config.MCPConfig {
+ 					cfg := *validMCP
+-					cfg.ConnectionMaxTTL = 0
++					cfg.ConnectionMaxTTL = -time.Second
+ 					return &cfg
+ 				}(),
+ 				OAuthHTTPClient: validOAuthClient,
+diff --git a/pkg/runtimeconfig/config.go b/pkg/runtimeconfig/config.go
+--- a/pkg/runtimeconfig/config.go
++++ b/pkg/runtimeconfig/config.go
+@@ -1751,8 +1751,8 @@ func loadMCPConfig(fs *pflag.FlagSet, lookupEnv func(string) (string, bool)) (MC
+ 	if err != nil {
+ 		return MCPConfig{}, fmt.Errorf("invalid mcp.connection-max-ttl: %w", err)
+ 	}
+-	if ttl <= 0 {
+-		return MCPConfig{}, errors.New("mcp.connection-max-ttl must be positive")
++	if ttl < 0 {
++		return MCPConfig{}, errors.New("mcp.connection-max-ttl must be non-negative")
+ 	}
+ 
+ 	startupWaitRaw := firstSet(
+diff --git a/pkg/runtimeconfig/shared_config_test.go b/pkg/runtimeconfig/shared_config_test.go
+--- a/pkg/runtimeconfig/shared_config_test.go
++++ b/pkg/runtimeconfig/shared_config_test.go
+@@ -1228,11 +1228,11 @@ func TestLoadRejectsEmptyMCPServerURL(t *testing.T) {
+ 	}
+ }
+ 
+-func TestLoadRejectsNonPositiveMCPConnectionTTL(t *testing.T) {
++func TestLoadRejectsNegativeMCPConnectionTTL(t *testing.T) {
+ 	args := []string{
+ 		"--control-plane.tunnel-id", flagTunnelID,
+ 		"--mcp.server-url", "https://mcp.default",
+-		"--mcp.connection-max-ttl=0s",
++		"--mcp.connection-max-ttl=-1s",
+ 	}
+ 	_, err := LoadRuntimeForTest(args, func(key string) (string, bool) {
+ 		if key == "CONTROL_PLANE_API_KEY" {
+@@ -1244,7 +1244,7 @@ func TestLoadRejectsNonPositiveMCPConnectionTTL(t *testing.T) {
+ 		return "", false
+ 	})
+ 	if err == nil {
+-		t.Fatalf("expected error for non-positive connection ttl")
++		t.Fatalf("expected error for negative connection ttl")
+ 	}
+ 	if !strings.Contains(err.Error(), "mcp.connection-max-ttl") {
+ 		t.Fatalf("unexpected error: %v", err)
+diff --git a/pkg/dispatcher/internal/codexweb_no_expiry_test.go b/pkg/dispatcher/internal/codexweb_no_expiry_test.go
+new file mode 100644
+--- /dev/null
++++ b/pkg/dispatcher/internal/codexweb_no_expiry_test.go
+@@ -0,0 +1,30 @@
++package dispatcherinternal
++
++import (
++  "io"
++  "log/slog"
++  "net/http"
++  "testing"
++  "time"
++
++  "github.com/stretchr/testify/require"
++)
++
++func TestCodexWebNewProcessorAcceptsDisabledConnectionTTL(t *testing.T) {
++  t.Parallel()
++  logger := slog.New(slog.NewTextHandler(io.Discard, nil))
++  responder := newRecordingResponder()
++  transport := &stubForwardingTransport{conn: &stubForwardingConnection{}}
++  mcpCfg := newTestMCPConfig(t, time.Second)
++  mcpCfg.ConnectionMaxTTL = 0
++
++  processor, err := NewProcessor(processorParams{
++    Logger: logger,
++    ChannelBindings: newTestChannelBindings(transport),
++    TunnelResponder: responder,
++    MCPConfig: mcpCfg,
++    OAuthHTTPClient: &http.Client{},
++    ControlPlaneCfg: newTestControlPlaneConfig(t),
++    MeterProvider: newTestMeterProvider(t),
++  })
++  require.NoError(t, err)
++  require.NotNil(t, processor)
++}
+diff --git a/pkg/runtimeconfig/codexweb_no_expiry_test.go b/pkg/runtimeconfig/codexweb_no_expiry_test.go
+new file mode 100644
+--- /dev/null
++++ b/pkg/runtimeconfig/codexweb_no_expiry_test.go
+@@ -0,0 +1,49 @@
++package runtimeconfig
++
++import (
++  "strings"
++  "testing"
++)
++
++func TestCodexWebAcceptsDisabledMCPConnectionTTL(t *testing.T) {
++  t.Parallel()
++  cfg, err := LoadRuntimeForTest([]string{
++    "--control-plane.tunnel-id", "tunnel_0123456789abcdef0123456789abcdef",
++    "--mcp.server-url", "https://mcp.default",
++  }, func(key string) (string, bool) {
++    switch key {
++    case "CONTROL_PLANE_API_KEY":
++      return "key", true
++    case "LOG_FORMAT":
++      return "struct-text", true
++    case "MCP_CONNECTION_MAX_TTL":
++      return "0s", true
++    default:
++      return "", false
++    }
++  })
++  if err != nil {
++    t.Fatalf("Load returned error: %v", err)
++  }
++  if cfg.MCP.ConnectionMaxTTL != 0 {
++    t.Fatalf("expected disabled connection ttl, got %s", cfg.MCP.ConnectionMaxTTL)
++  }
++}
++
++func TestCodexWebRejectsNegativeMCPConnectionTTL(t *testing.T) {
++  t.Parallel()
++  _, err := LoadRuntimeForTest([]string{
++    "--control-plane.tunnel-id", "tunnel_0123456789abcdef0123456789abcdef",
++    "--mcp.server-url", "https://mcp.default",
++    "--mcp.connection-max-ttl=-1s",
++  }, func(key string) (string, bool) {
++    if key == "CONTROL_PLANE_API_KEY" {
++      return "key", true
++    }
++    if key == "LOG_FORMAT" {
++      return "struct-text", true
++    }
++    return "", false
++  })
++  if err == nil {
++    t.Fatal("expected error for negative connection ttl")
++  }
++  if !strings.Contains(err.Error(), "mcp.connection-max-ttl") {
++    t.Fatalf("unexpected error: %v", err)
++  }
++}

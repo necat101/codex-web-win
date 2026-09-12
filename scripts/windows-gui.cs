@@ -7,6 +7,7 @@ using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Globalization;
 using System.IO;
+using System.Media;
 using System.Runtime.InteropServices;
 using System.Security.Principal;
 using System.Text;
@@ -1863,6 +1864,12 @@ internal sealed class MainWindow : Form
 
     private void OnChildLine(string line, bool error)
     {
+        bool attentionRequested = line != null && line.IndexOf('\a') >= 0;
+        if (attentionRequested)
+        {
+            line = line.Replace("\a", "");
+            try { SystemSounds.Hand.Play(); } catch { }
+        }
         string safe = Sanitize(line);
         if (safe.Length == 0) return;
         SafeUi(delegate { AppendLog((error ? "error: " : "") + safe); });

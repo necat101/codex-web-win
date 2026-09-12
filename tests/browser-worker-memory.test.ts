@@ -19,6 +19,7 @@ import {
   CHATGPT_RENDERER_TELEMETRY_MS,
   CHATGPT_IGNORED_DEFAULT_ARGS,
   CHATGPT_TOOL_WAIT_POLL_MS,
+  CHATGPT_TOOL_CONFIRMATION_REMINDER_MS,
   CHATGPT_TRACE_POLL_MS,
   CHATGPT_UI_POLL_MS,
   chatGptAttachmentStatusTextKind,
@@ -36,6 +37,7 @@ import {
   ChatGptAttachmentReadinessTracker,
   ChatGptCompletionTracker,
   ChatGptTurnDomHealthTracker,
+  ChatGptToolConfirmationReminder,
   ChatGptVisibleTraceTracker,
   closeChatGptBrowserWorkers,
 } from "../src/adapters/chatgpt-web/browser-worker";
@@ -65,6 +67,16 @@ function fakePageEvents() {
 }
 
 describe("ChatGPT browser worker memory reuse", () => {
+  test("rate-limits manual tool-confirmation reminders and resets after dismissal", () => {
+    const reminder = new ChatGptToolConfirmationReminder();
+
+    expect(reminder.observe(true, 1_000)).toBe(true);
+    expect(reminder.observe(true, 1_000 + CHATGPT_TOOL_CONFIRMATION_REMINDER_MS - 1)).toBe(false);
+    expect(reminder.observe(true, 1_000 + CHATGPT_TOOL_CONFIRMATION_REMINDER_MS)).toBe(true);
+    expect(reminder.observe(false, 50_000)).toBe(false);
+    expect(reminder.observe(true, 50_001)).toBe(true);
+  });
+
   test("recognizes both Temporary Chat personalization states idempotently", () => {
     expect(chatGptTemporaryChatPersonalizationState(["Personalized"])).toBe("personalized");
     expect(chatGptTemporaryChatPersonalizationState(["Personalized menu"])).toBe("personalized");

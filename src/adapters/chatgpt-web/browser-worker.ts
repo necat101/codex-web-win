@@ -45,6 +45,7 @@ export const CHATGPT_UI_POLL_MS = 500;
 export const CHATGPT_TRACE_POLL_MS = 4_000;
 export const CHATGPT_RENDERER_TELEMETRY_MS = 15_000;
 export const CHATGPT_RECOVERY_SIGNAL_POLL_MS = 2_500;
+export const CHATGPT_TOOL_CONFIRMATION_REMINDER_MS = 30_000;
 export const CHATGPT_CONSTRAINED_PARALLELISM = 4;
 export const CHATGPT_ATTACHMENT_NETWORK_SETTLE_MS = 2_000;
 export const CHATGPT_ATTACHMENT_FAILURE_GRACE_MS = 5_000;
@@ -182,6 +183,31 @@ export function chatGptTurnIsComplete(state: {
     && !state.running
     && state.currentText.length > 0
     && state.completionActionPresent;
+}
+
+/**
+ * Rate-limit attention reminders while ChatGPT is waiting for a manual
+ * connector approval. A dismissed prompt resets the cadence so a later,
+ * unrelated prompt always alerts immediately.
+ */
+export class ChatGptToolConfirmationReminder {
+  private nextReminderAt = 0;
+
+  constructor(private readonly intervalMs = CHATGPT_TOOL_CONFIRMATION_REMINDER_MS) {
+    if (!Number.isFinite(intervalMs) || intervalMs <= 0) {
+      throw new RangeError("tool confirmation reminder interval must be positive");
+    }
+  }
+
+  observe(present: boolean, now = Date.now()): boolean {
+    if (!present) {
+      this.nextReminderAt = 0;
+      return false;
+    }
+    if (now < this.nextReminderAt) return false;
+    this.nextReminderAt = now + this.intervalMs;
+    return true;
+  }
 }
 
 export class ChatGptCompletionTracker {
@@ -1071,6 +1097,7 @@ export class ChatGptBrowserWorker {
   private page?: Page;
   private tail: Promise<void> = Promise.resolve();
   private lastStorageStateJson?: string;
+  private readonly toolConfirmationReminder = new ChatGptToolConfirmationReminder();
 
   private constructor(
     private readonly config: ResolvedBrowserConfig,
@@ -2767,10 +2794,20 @@ export class ChatGptBrowserWorker {
     const heading = page.getByText(`Allow ChatGPT to use ${this.config.appName}?`, { exact: true }).last();
     if (!await heading.isVisible().catch(() => false)) return false;
     if (!this.config.autoApproveToolCalls) {
-      throw new Error(
-        `ChatGPT is waiting for confirmation to use ${this.config.appName}; set chatgptWeb.autoApproveToolCalls=true to authorize per-call "Allow once" clicks`,
-      );
+      if (this.toolConfirmationReminder.observe(true)) {
+        // BEL reaches an attached terminal directly. The Windows control center
+        // recognizes the same byte on redirected child output and plays the
+        // configured system alert sound.
+        process.stderr.write("\x07");
+        console.warn(
+          `[chatgpt-web] ChatGPT is waiting for confirmation to use ${this.config.appName}; `
+          + `click "Allow once" in the controlled Chrome window, or enable `
+          + "chatgptWeb.autoApproveToolCalls for automatic one-time approvals",
+        );
+      }
+      return false;
     }
+    this.toolConfirmationReminder.observe(false);
     const allowOnce = page.getByRole("button", { name: "Allow once", exact: true }).last();
     await allowOnce.waitFor({ state: "visible", timeout: 10_000 });
     await allowOnce.click();
@@ -3249,6 +3286,9 @@ export class ChatGptBrowserWorker {
           scanRecoverySignals,
           scanTraceBlocks,
         );
+        if (!snapshot.toolConfirmationPresent) {
+          this.toolConfirmationReminder.observe(false);
+        }
         if (mode.localTools
           && snapshot.deliveryTimeoutPresent
           && await this.recoverMessageDeliveryTimeout(page, deliveryTimeoutRecoveries)) {
@@ -3271,9 +3311,11 @@ export class ChatGptBrowserWorker {
           await waitForActivity(0, activePollingProfile.responseMs);
           continue;
         }
-        if (mode.localTools && snapshot.toolConfirmationPresent && await this.handleToolConfirmation(page)) {
-          completionTracker.reset();
-          recordActivity();
+        if (mode.localTools && snapshot.toolConfirmationPresent) {
+          if (await this.handleToolConfirmation(page)) {
+            completionTracker.reset();
+            recordActivity();
+          }
           await waitForActivity(0, activePollingProfile.responseMs);
           continue;
         }

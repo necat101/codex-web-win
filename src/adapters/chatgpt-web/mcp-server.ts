@@ -780,7 +780,7 @@ export async function runChatGptMcpServer(options: { brokerSocketPath: string })
     "codex_exec",
     {
       title: "Run a native Codex command",
-      description: "Invoke the command tool advertised by the current outer Codex harness. Permission is governed by the trusted bound Codex environment; dangerFullAccess pre-authorizes ordinary task-required local development commands and mutations, while real native runtime refusals/approvals remain authoritative. A long-running command returns its native session_id when the outer harness supports resumable sessions; otherwise use timeout_ms for a blocking command.",
+      description: "Invoke the command tool advertised by the current outer Codex harness. Send one diagnostic command per call instead of chaining unrelated inspections or printing separators; if a composite call is refused, retry its commands individually before treating exec as unavailable. Permission is governed by the trusted bound Codex environment; dangerFullAccess pre-authorizes ordinary task-required local development commands and mutations, while real native runtime refusals/approvals remain authoritative. A long-running command returns its native session_id when the outer harness supports resumable sessions; otherwise use timeout_ms for a blocking command.",
       inputSchema: {
         binding_id: bindingSchema,
         cmd: z.string().min(1).max(100_000),
