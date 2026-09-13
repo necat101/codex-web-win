@@ -1,0 +1,18 @@
+diff --git a/pkg/runtimeconfig/config.go b/pkg/runtimeconfig/config.go
+--- a/pkg/runtimeconfig/config.go
++++ b/pkg/runtimeconfig/config.go
+@@ -1754,3 +1754,3 @@
+-	if ttl <= 0 {
+-		return MCPConfig{}, errors.New("mcp.connection-max-ttl must be positive")
++	if ttl < 0 {
++		return MCPConfig{}, errors.New("mcp.connection-max-ttl must be non-negative")
+ 	}
+diff --git a/pkg/dispatcher/internal/processor.go b/pkg/dispatcher/internal/processor.go
+--- a/pkg/dispatcher/internal/processor.go
++++ b/pkg/dispatcher/internal/processor.go
+@@ -183,3 +183,3 @@
+-	if p.MCPConfig.ConnectionMaxTTL <= 0 {
+-		return nil, fmt.Errorf("dispatcher processor: non-positive MCP connection TTL")
++	if p.MCPConfig.ConnectionMaxTTL < 0 {
++		return nil, fmt.Errorf("dispatcher processor: negative MCP connection TTL")
+ 	}
