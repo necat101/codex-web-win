@@ -2,6 +2,9 @@ import { createHash } from "node:crypto";
 import { cpSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { smokeNativeMcp } from "./smoke-native-mcp";
 import {
   requireTunnelClientTarget,
   TUNNEL_CLIENT_BUILD_ID,
@@ -55,7 +58,7 @@ for (const forbidden of [sourceRoot, dirname(sourceBundle), "/private/tmp/codex-
 }
 
 const manifest = JSON.parse(readFileSync(join(runtimeRoot, "manifest.json"), "utf8")) as Record<string, unknown>;
-if (manifest.schemaVersion !== 1 || manifest.appVersion !== "0.2.18" || manifest.playwright !== "1.62.0"
+if (manifest.schemaVersion !== 1 || manifest.appVersion !== "0.2.19" || manifest.playwright !== "1.62.0"
   || manifest.platform !== process.platform || manifest.arch !== process.arch
   || manifest.launcher !== `bin/${launcherName}` || !existsSync(runtimeExecutable)
   || (process.platform === "win32"
@@ -86,7 +89,7 @@ const runtimeCommand = (args: string[]) => process.platform === "win32"
   ? [launcher, ...args]
   : [launcher, ...args];
 const version = Bun.spawnSync(launcherCommand(["--version"]), { stdout: "pipe", stderr: "pipe" });
-if (version.exitCode !== 0 || version.stdout.toString().trim() !== "0.2.18") {
+if (version.exitCode !== 0 || version.stdout.toString().trim() !== "0.2.19") {
   throw new Error(`Relocated launcher failed: ${version.stderr.toString()}`);
 }
 
@@ -131,9 +134,12 @@ mkdirSync(codexHome, { recursive: true });
 const portServer = Bun.listen({ hostname: "127.0.0.1", port: 0, socket: { data() {} } });
 const port = portServer.port;
 portServer.stop();
+const legacyMcpPortServer = Bun.listen({ hostname: "127.0.0.1", port: 0, socket: { data() {} } });
+const legacyMcpPort = legacyMcpPortServer.port;
+legacyMcpPortServer.stop();
 const config = {
   version: 2,
-  releaseVersion: "0.2.18",
+  releaseVersion: "0.2.19",
   mode: "browser-only",
   host: "127.0.0.1",
   port,
@@ -156,7 +162,22 @@ const config = {
 writeFileSync(join(appHome, "config.json"), `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
 writeFileSync(config.storageStatePath, "{}\n", { mode: 0o600 });
 
-const env = { ...process.env, CODEX_CHATGPT_WEB_HOME: appHome, CODEX_HOME: codexHome };
+const env = {
+  ...process.env,
+  CODEX_CHATGPT_WEB_HOME: appHome,
+  CODEX_HOME: codexHome,
+  // Keep packaging smokes isolated from a live installed harness while the
+  // production default remains the historical 127.0.0.1:17847/v1 route.
+  CODEX_CHATGPT_WEB_LEGACY_MCP_PORT: String(legacyMcpPort),
+};
+// Exercise diagnostics after a valid config loads. A --version/--help smoke
+// never reached the former Bun.which calls in the Node-based Windows package.
+const doctor = Bun.spawnSync(runtimeCommand(["doctor", "--json"]), { env, stdout: "pipe", stderr: "pipe" });
+const doctorReport = JSON.parse(doctor.stdout.toString()) as { checks?: { id: string }[] };
+if (!doctorReport.checks?.some(check => check.id === "media-tools")) {
+  throw new Error(`Packaged diagnostics did not finish: ${doctor.stderr.toString()}`);
+}
+await smokeNativeMcp(launcher, []);
 const child = Bun.spawn(runtimeCommand([process.platform === "win32" ? "session" : "serve"]), {
   env,
   stdout: "pipe",
@@ -176,6 +197,20 @@ try {
   const payload = await health.json() as Record<string, unknown>;
   if (payload.service !== "codex-chatgpt-web" || payload.mode !== "browser-only") {
     throw new Error(`unexpected health payload: ${JSON.stringify(payload)}`);
+  }
+
+  const legacyMcpClient = new Client({ name: "release-http-compat-smoke", version: "1.0.0" });
+  try {
+    await legacyMcpClient.connect(new StreamableHTTPClientTransport(
+      new URL(`http://127.0.0.1:${legacyMcpPort}/v1`),
+    ));
+    const legacyTools = await legacyMcpClient.listTools();
+    const legacyToolNames = new Set(legacyTools.tools.map(tool => tool.name));
+    if (!legacyToolNames.has("codex_bind_turn") || !legacyToolNames.has("codex_tool_call")) {
+      throw new Error(`legacy HTTP MCP compatibility route exposed the wrong tool set: ${JSON.stringify([...legacyToolNames])}`);
+    }
+  } finally {
+    await legacyMcpClient.close();
   }
 
   const unauthenticatedModels = await fetch(`http://127.0.0.1:${port}/v1/models`);

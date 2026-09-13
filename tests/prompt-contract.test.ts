@@ -28,7 +28,7 @@ describe("ChatGPT Web transport contract", () => {
     expect(compiled.text).toContain("__bridge_read_compaction");
     expect(compiled.text).toContain("CODEX_SHARED_TUNNEL_ROUTE_MISS");
     expect(compiled.text).toContain("up to 8 additional times");
-    expect(compiled.text).toContain("Return only the answer that the outer Codex task should receive.");
+    expect(compiled.text).toContain("Send task-facing progress commentary while working and a final answer when finished.");
     expect(compiled.text.length).toBeLessThan(5_200);
   });
 });

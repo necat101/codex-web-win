@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import type { AppConfig } from "../src/config";
 import { augmentNativeModelCatalog } from "../src/model-catalog";
-import { compactRequest, responseRequest } from "../src/server";
+import { compactRequest, responseRequest, routeChatGptWebRequest } from "../src/server";
 
 function config(mode: "browser-only" | "full", deepSeekEnabled = false): AppConfig {
   return {
@@ -35,6 +35,25 @@ const nativeTemplate = {
 };
 
 describe("browser-only native routing guard", () => {
+  test("routes Luna low and Sol high to distinct ChatGPT backend models", () => {
+    const luna = {
+      modelId: "chatgpt-web/light",
+      options: { reasoning: "high" },
+    } as any;
+    const sol = {
+      modelId: "chatgpt-web/high",
+      options: { reasoning: "low" },
+    } as any;
+
+    routeChatGptWebRequest(luna, config("full"));
+    routeChatGptWebRequest(sol, config("full"));
+
+    expect(luna.modelId).toBe("gpt-5.6-luna");
+    expect(luna.options.reasoning).toBe("low");
+    expect(sol.modelId).toBe("gpt-5.6-sol");
+    expect(sol.options.reasoning).toBe("high");
+  });
+
   test("hides native models from the catalog", () => {
     const catalog = augmentNativeModelCatalog(nativeTemplate, config("browser-only"));
     const slugs = (catalog.models as Array<{ slug: string }>).map(model => model.slug);

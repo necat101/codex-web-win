@@ -10,6 +10,8 @@ internal static class WindowsJobLauncher
 {
     private const uint CREATE_SUSPENDED = 0x00000004;
     private const uint INFINITE = 0xFFFFFFFF;
+    private const uint ES_CONTINUOUS = 0x80000000;
+    private const uint ES_SYSTEM_REQUIRED = 0x00000001;
     private const uint STARTF_USESTDHANDLES = 0x00000100;
     private const uint JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000;
     private const int JobObjectExtendedLimitInformation = 9;
@@ -148,6 +150,9 @@ internal static class WindowsJobLauncher
 
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern IntPtr GetStdHandle(int standardHandle);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern uint SetThreadExecutionState(uint flags);
 
     private static string DecodeConfigurationValue(string value)
     {
@@ -306,9 +311,18 @@ internal static class WindowsJobLauncher
         PROCESS_INFORMATION process = new PROCESS_INFORMATION();
         bool childCreated = false;
         bool childAssigned = false;
+        bool keepAwake = false;
         try
         {
             LaunchConfiguration launch = ResolveLaunch(args);
+            // Prevent automatic idle sleep only while the foreground session
+            // owns its children. The display may turn off; exiting releases
+            // the request without changing the user's power plan.
+            if (launch.Arguments.Length > 0 && (launch.Arguments[0] == "session" || launch.Arguments[0] == "serve"))
+            {
+                keepAwake = SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED) != 0;
+                if (!keepAwake) Console.Error.WriteLine("Warning: Windows could not keep this session awake; automatic sleep may interrupt work.");
+            }
             Console.CancelKeyPress += HandleCancel;
 
             activeJob = CreateJobObject(IntPtr.Zero, null);
@@ -392,6 +406,7 @@ internal static class WindowsJobLauncher
                 hardStopTimer.Dispose();
             }
             CloseActiveJob();
+            if (keepAwake) SetThreadExecutionState(ES_CONTINUOUS);
         }
     }
 }

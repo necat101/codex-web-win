@@ -20,7 +20,7 @@ internal static class GuiProgram
 {
     internal const string ProductName = "Codex ChatGPT Web";
     internal const string AppName = "codex-chatgpt-web-gui";
-    internal const string Version = "0.2.18";
+    internal const string Version = "0.2.19";
     internal const string WindowTitle = "Codex ChatGPT Web - Windows Control Center";
 
     [DllImport("user32.dll")]

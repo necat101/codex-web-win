@@ -18,7 +18,7 @@ param(
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
-$DefaultVersion = "0.2.18"
+$DefaultVersion = "0.2.19"
 $DocumentNames = @(
   "LICENSE",
   "NOTICE.md",

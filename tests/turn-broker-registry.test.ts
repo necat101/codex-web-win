@@ -32,7 +32,7 @@ describe("active-turn broker tool registry", () => {
     ];
 
     try {
-      const token = await broker.register(environment(initial), 60_000, "registry-test");
+      const token = await broker.register(environment(initial), "registry-test");
 
       const afterEmpty = broker.updateEnvironment(token, environment([]));
       expect(afterEmpty.tools.map(value => `${value.namespace}__${value.name}`)).toEqual([

@@ -396,6 +396,7 @@ try {
 
   const userStateBefore = realUserState();
   const environment = isolatedEnvironment(appHome, codexHome);
+  environment.CODEX_CHATGPT_WEB_LEGACY_MCP_PORT = String(await availableLoopbackPort());
   environment.CODEX_CHATGPT_WEB_SMOKE_TUNNEL_LOG = tunnelClientInvocationLogPath;
   const runtimeArchitecture = process.arch === "arm64" ? "arm64" : "x64";
   seedRuntimeBundle(retiredRuntimeRoot, retiredVersion, runtimeArchitecture);

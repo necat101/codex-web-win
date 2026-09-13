@@ -188,7 +188,7 @@ describe("Codex exec gateway discovery", () => {
       yieldTimeMs: 1_000,
     })).toEqual({
       command: "bun run build",
-      timeout_ms: 300_000,
+      timeout_ms: 0,
     });
 
     expect(shellCommandInvocationArgs({
@@ -206,7 +206,7 @@ describe("Codex exec gateway discovery", () => {
       resumable: true,
     })).toEqual({
       command: "bun run verify",
-      timeout_ms: 300_000,
+      timeout_ms: 0,
     });
   });
 
@@ -238,7 +238,7 @@ describe("Codex exec gateway discovery", () => {
     expect(program).toContain('tools.write_stdin({ session_id: commandSessionId');
     expect(program).toContain('tools.wait({ cell_id: String(commandSessionId)');
     expect(program).toContain('while (commandResult && typeof commandResult === "object" && commandResult.session_id !== undefined)');
-    expect(program).toContain('"timeout_ms":300000');
+    expect(program).toContain('"timeout_ms":0');
     expect(program).toContain('"bun run verify"');
   });
 

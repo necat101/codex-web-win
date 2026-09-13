@@ -376,10 +376,13 @@ describe("ChatGPT Web compaction continuation", () => {
     const initial = sessions.getOrCreate("long-running", start, "long-running-family");
     now += 31 * 60_000;
     const thirtyMinuteReplay = sessions.getOrCreate("long-running", start, "long-running-family");
+    now += 48 * 60 * 60_000;
+    const fortyEightHourReplay = sessions.getOrCreate("long-running", start, "long-running-family");
     now += 1_000 * 365 * 24 * 60 * 60_000;
     const thousandYearReplay = sessions.getOrCreate("long-running", start, "long-running-family");
 
     expect(thirtyMinuteReplay).toBe(initial);
+    expect(fortyEightHourReplay).toBe(initial);
     expect(thousandYearReplay).toBe(initial);
     expect(sessions.activeCount()).toBe(1);
     expect(starts).toBe(1);

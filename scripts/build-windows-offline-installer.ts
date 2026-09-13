@@ -117,8 +117,11 @@ const powershell = join(windowsDirectory, "System32", "WindowsPowerShell", "v1.0
 const quotePowerShell = (value: string): string => `'${value.replaceAll("'", "''")}'`;
 const archiveCommand = [
   "$ErrorActionPreference = 'Stop'",
-  `Compress-Archive -Path (Join-Path ${quotePowerShell(runtimeRoot)} '*') `
-    + `-DestinationPath ${quotePowerShell(runtimeArchive)} -CompressionLevel Optimal`,
+  // The built-in .NET API works even when PowerShell 7's inherited module
+  // paths prevent Windows PowerShell from loading Microsoft.PowerShell.Archive.
+  "Add-Type -AssemblyName System.IO.Compression.FileSystem",
+  `[IO.Compression.ZipFile]::CreateFromDirectory(${quotePowerShell(runtimeRoot)}, `
+    + `${quotePowerShell(runtimeArchive)}, [IO.Compression.CompressionLevel]::Optimal, $false)`,
 ].join("; ");
 const encodedArchiveCommand = Buffer.from(archiveCommand, "utf16le").toString("base64");
 
