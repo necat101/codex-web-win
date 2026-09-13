@@ -1,4 +1,6 @@
-export const CHATGPT_WEB_MODEL_ID = "gpt-5.6-sol";
+export const CHATGPT_WEB_SOL_MODEL_ID = "gpt-5.6-sol";
+export const CHATGPT_WEB_LUNA_MODEL_ID = "gpt-5.6-luna";
+export const CHATGPT_WEB_MODEL_ID = CHATGPT_WEB_SOL_MODEL_ID;
 
 export interface ChatGptWebCapabilities {
   localToolsEnabled: boolean;
@@ -9,7 +11,7 @@ export interface ChatGptWebModelMode {
   modelId: string;
   effort: "low" | "medium" | "high" | "xhigh" | "max";
   displayLabel: "Instant" | "Medium" | "High" | "Extra High" | "Pro";
-  uiEffortLabel: "Instant 5.5" | "Medium" | "High" | "Extra High" | "Pro";
+  uiEffortLabel: "Instant" | "Medium" | "High" | "Extra High" | "Pro";
   localTools: boolean;
 }
 
@@ -18,13 +20,19 @@ export function resolveChatGptWebModelMode(
   reasoning: string | undefined,
   capabilities: ChatGptWebCapabilities,
 ): ChatGptWebModelMode {
-  if (modelId !== CHATGPT_WEB_MODEL_ID) {
+  if (modelId !== CHATGPT_WEB_SOL_MODEL_ID && modelId !== CHATGPT_WEB_LUNA_MODEL_ID) {
     throw new Error(`ChatGPT web model is not supported: ${modelId}`);
   }
   const effort = reasoning ?? "high";
+  if (modelId === CHATGPT_WEB_LUNA_MODEL_ID && effort !== "low") {
+    throw new Error(`GPT-5.6 Luna only supports the low/Instant ChatGPT web route, received: ${effort}`);
+  }
+  if (modelId === CHATGPT_WEB_SOL_MODEL_ID && effort === "low") {
+    throw new Error("GPT-5.6 Sol is not the low/Instant ChatGPT web route; use GPT-5.6 Luna");
+  }
   switch (effort) {
     case "low":
-      return { modelId, effort, displayLabel: "Instant", uiEffortLabel: "Instant 5.5", localTools: capabilities.localToolsEnabled };
+      return { modelId, effort, displayLabel: "Instant", uiEffortLabel: "Instant", localTools: capabilities.localToolsEnabled };
     case "medium":
       return { modelId, effort, displayLabel: "Medium", uiEffortLabel: "Medium", localTools: capabilities.localToolsEnabled };
     case "high":

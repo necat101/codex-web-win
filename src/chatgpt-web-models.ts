@@ -1,5 +1,6 @@
 export const CHATGPT_WEB_MODEL_PREFIX = "chatgpt-web/";
 export const CHATGPT_WEB_BACKEND_MODEL = "gpt-5.6-sol";
+export const CHATGPT_WEB_LUNA_MODEL = "gpt-5.6-luna";
 
 export type ChatGptWebCodexEffort = "low" | "medium" | "high" | "xhigh" | "ultra";
 export type ChatGptWebAdapterEffort = "low" | "medium" | "high" | "xhigh" | "max";
@@ -8,6 +9,7 @@ export interface ChatGptWebModelRoute {
   slug: string;
   displayName: string;
   description: string;
+  backendModel: typeof CHATGPT_WEB_BACKEND_MODEL | typeof CHATGPT_WEB_LUNA_MODEL;
   codexEffort: ChatGptWebCodexEffort;
   adapterEffort: ChatGptWebAdapterEffort;
   requiresPro: boolean;
@@ -22,8 +24,9 @@ export interface ChatGptWebModelRoute {
 export const CHATGPT_WEB_MODEL_ROUTES: readonly ChatGptWebModelRoute[] = [
   {
     slug: "chatgpt-web/light",
-    displayName: "ChatGPT Web — Instant",
-    description: "ChatGPT Web Instant through the native Codex harness.",
+    displayName: "ChatGPT Web — GPT-5.6 Luna (Instant)",
+    description: "GPT-5.6 Luna Instant through the native Codex harness, including Free ChatGPT accounts.",
+    backendModel: CHATGPT_WEB_LUNA_MODEL,
     codexEffort: "low",
     adapterEffort: "low",
     requiresPro: false,
@@ -32,14 +35,16 @@ export const CHATGPT_WEB_MODEL_ROUTES: readonly ChatGptWebModelRoute[] = [
     slug: "chatgpt-web/medium",
     displayName: "ChatGPT Web — Medium",
     description: "ChatGPT Web Medium through the native Codex harness.",
+    backendModel: CHATGPT_WEB_BACKEND_MODEL,
     codexEffort: "medium",
     adapterEffort: "medium",
     requiresPro: false,
   },
   {
     slug: "chatgpt-web/high",
-    displayName: "ChatGPT Web — High",
-    description: "ChatGPT Web High through the native Codex harness.",
+    displayName: "ChatGPT Web — GPT-5.6 Sol (High)",
+    description: "GPT-5.6 Sol High through the native Codex harness.",
+    backendModel: CHATGPT_WEB_BACKEND_MODEL,
     codexEffort: "high",
     adapterEffort: "high",
     requiresPro: false,
@@ -48,6 +53,7 @@ export const CHATGPT_WEB_MODEL_ROUTES: readonly ChatGptWebModelRoute[] = [
     slug: "chatgpt-web/extra-high",
     displayName: "ChatGPT Web — Extra High",
     description: "ChatGPT Web Extra High through the native Codex harness.",
+    backendModel: CHATGPT_WEB_BACKEND_MODEL,
     codexEffort: "xhigh",
     adapterEffort: "xhigh",
     requiresPro: false,
@@ -56,6 +62,7 @@ export const CHATGPT_WEB_MODEL_ROUTES: readonly ChatGptWebModelRoute[] = [
     slug: "chatgpt-web/pro",
     displayName: "ChatGPT Web — Pro",
     description: "Account-gated ChatGPT Pro through the native Codex harness. Local tool calls are unavailable in this mode.",
+    backendModel: CHATGPT_WEB_BACKEND_MODEL,
     codexEffort: "ultra",
     adapterEffort: "max",
     requiresPro: true,

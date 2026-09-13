@@ -135,9 +135,9 @@ export interface BrowserTurn {
   prepare: () => Promise<CompiledChatGptWebPrompt & { release: () => void }>;
   abortSignal?: AbortSignal;
   onHeartbeat?: () => void;
-  /** Renew turn-scoped capabilities when the browser proves it is active. */
   /** Visible ChatGPT reasoning-summary step titles only; never hidden chain-of-thought. */
-  onReasoningSummary?: (text: string) => void;
+  onReasoningSummary?: (text: string, continuation?: boolean) => void;
+  hasBoundTurn?: () => boolean;
   /** Stable visible ChatGPT prose between status/tool rows. */
   onCommentary?: (text: string, continuation?: boolean) => void;
   /** Append-only, structurally stable Markdown chunks. */
@@ -551,7 +551,7 @@ export class ChatGptVisibleTraceTracker {
 export function chatGptEffortLabelsMatch(current: string, desired: string): boolean {
   const normalize = (value: string) => {
     const label = value.replace(/\s+/g, " ").trim();
-    return /^(?:Instant|Instant 5\.5)$/.test(label) ? "Instant 5.5" : label;
+    return /^Instant(?:\s+5\.\d+)?$/.test(label) ? "Instant" : label;
   };
   return normalize(current) === normalize(desired);
 }
@@ -1512,7 +1512,7 @@ export class ChatGptBrowserWorker {
   ): Promise<ChatGptWebModelMode> {
     const mode = resolveChatGptWebModelMode(modelId, reasoning, capabilities);
     const currentEffort = page.getByRole("button", {
-      name: /^(?:Instant(?:\s+5\.5)?|Medium|High|Extra High|Pro)$/,
+      name: /^(?:Instant(?:\s+5\.\d+)?|Medium|High|Extra High|Pro)$/,
     }).last();
     try {
       await currentEffort.waitFor({ state: "visible", timeout: 70_000 });
@@ -1521,15 +1521,18 @@ export class ChatGptBrowserWorker {
     }
     if (chatGptEffortLabelsMatch(await currentEffort.innerText(), mode.uiEffortLabel)) return mode;
     await currentEffort.click();
-    const effortChoice = page.getByRole("menuitem", { name: mode.uiEffortLabel, exact: true }).or(
-      page.getByRole("menuitemradio", { name: mode.uiEffortLabel, exact: true }),
+    const effortChoiceName = mode.uiEffortLabel === "Instant"
+      ? /^Instant(?:\s+5\.\d+)?$/
+      : mode.uiEffortLabel;
+    const effortChoice = page.getByRole("menuitem", { name: effortChoiceName, exact: true }).or(
+      page.getByRole("menuitemradio", { name: effortChoiceName, exact: true }),
     ).last();
     try {
       await effortChoice.waitFor({ state: "visible", timeout: 20_000 });
     } catch {
       const choices = (await page.locator('[role="menuitem"], [role="menuitemradio"]').allInnerTexts().catch(() => []))
         .map(value => value.replace(/\s+/g, " ").trim())
-        .filter(value => /^(?:Instant(?: 5\.5)?|Medium|High|Extra High|Pro)$/.test(value));
+        .filter(value => /^(?:Instant(?: 5\.\d+)?|Medium|High|Extra High|Pro)$/.test(value));
       throw new Error(
         `ChatGPT effort ${JSON.stringify(mode.uiEffortLabel)} is unavailable in the authenticated account UI`
         + (choices.length > 0 ? `; available: ${choices.join(", ")}` : ""),
@@ -1546,7 +1549,7 @@ export class ChatGptBrowserWorker {
       throw new Error("effort control did not render the selected label");
     } catch {
       const visible = await page.getByRole("button", {
-        name: /^(?:Instant(?:\s+5\.5)?|Medium|High|Extra High|Pro)$/,
+        name: /^(?:Instant(?:\s+5\.\d+)?|Medium|High|Extra High|Pro)$/,
       }).allInnerTexts().catch(() => []);
       throw new Error(
         `ChatGPT did not confirm effort ${JSON.stringify(mode.uiEffortLabel)}`
@@ -3035,17 +3038,23 @@ export class ChatGptBrowserWorker {
         deadline = Date.now() + inactivityBudgetMs;
         schedulerGapExtensionRemainingMs = CHATGPT_MAX_SCHEDULER_GAP_EXTENSION_MS;
       };
-      const traceSources = new Map<string, "dom" | "sse">();
+      const traceSources = new Map<string, { source: "dom" | "sse"; at: number; text: string }>();
       const emitTrace = (trace: ChatGptVisibleTraceEvent, source: "dom" | "sse") => {
         diagnostics.count(`${source}_${trace.kind}_observed`);
         const owner = traceSources.get(trace.kind);
-        if (owner && owner !== source) return;
-        traceSources.set(trace.kind, source);
-        const text = stripChatGptTransportMarkers(trace.text);
+        // Prefer the active source, but do not lock an entire 24h turn to a
+        // network stream that can end/reconnect or a DOM block that can remount.
+        if (owner && owner.source !== source) {
+          if (owner.text === trace.text || Date.now() - owner.at < 10_000) return;
+        }
+        // SSE continuations are fragments: trimming each one joins words and
+        // destroys whitespace at chunk boundaries. DOM blocks are whole text.
+        const text = trace.continuation ? trace.text : stripChatGptTransportMarkers(trace.text);
         if (!text) return;
+        traceSources.set(trace.kind, { source, at: Date.now(), text: trace.text });
         recordActivity();
         if (trace.kind === "commentary") turn.onCommentary?.(text, trace.continuation === true);
-        else turn.onReasoningSummary?.(text);
+        else turn.onReasoningSummary?.(text, trace.continuation === true);
         diagnostics.count(`forwarded_${trace.kind}_chars`, text.length);
       };
       const page = await this.runStage(
@@ -3120,8 +3129,9 @@ export class ChatGptBrowserWorker {
         if (turn.abortSignal?.aborted) return;
         if (delta.kind === "final") {
           recordActivity();
-          turn.onTextDelta(delta.text);
-          diagnostics.count("forwarded_final_chars", delta.text.length);
+          // Hold provisional network text until browser completion is proven.
+          // A Responses round may still yield a tool after its text, and a
+          // partially decoded body must never replace the final rendered answer.
         } else emitTrace({ ...delta, kind: delta.kind }, "sse");
       }, diagnostics);
       await eventStream.start(page);
@@ -3259,12 +3269,6 @@ export class ChatGptBrowserWorker {
           );
           continue;
         }
-        // A completed final-channel message is stronger evidence than a Copy
-        // control that may be hidden, remounted, or absent in a new ChatGPT UI.
-        if (eventStream.decoder.finalComplete && eventStream.decoder.finalText) {
-          finalText = eventStream.decoder.finalText;
-          break;
-        }
         if (previousPendingToolCount > 0) {
           await rendererTelemetry?.sample("tool-wait-end", 0, true);
           previousPendingToolCount = 0;
@@ -3333,7 +3337,7 @@ export class ChatGptBrowserWorker {
             responsePresent: snapshot.responsePresent,
             running,
             currentText: snapshot.visibleTextLength > 0 ? "present" : "",
-            completionActionPresent: snapshot.completionActionPresent,
+            completionActionPresent: snapshot.completionActionPresent || eventStream.decoder.finalComplete,
             probeSucceeded: snapshot.probeSucceeded,
           });
           if (domError) throw new Error(domError);
@@ -3341,7 +3345,7 @@ export class ChatGptBrowserWorker {
             responsePresent: snapshot.responsePresent,
             running,
             currentText: snapshot.completionSignature,
-            completionActionPresent: snapshot.completionActionPresent,
+            completionActionPresent: snapshot.completionActionPresent || eventStream.decoder.finalComplete,
           };
           let completionReady = false;
           if (Date.now() >= completionBlockedUntil) {
@@ -3363,10 +3367,6 @@ export class ChatGptBrowserWorker {
             if (snapshot.visibleText === "api_tool unavailable") {
               throw new Error("ChatGPT selected mode rejected the Codex Native MCP tool (api_tool unavailable)");
             }
-            if (eventStream.decoder.finalText) {
-              finalText = eventStream.decoder.finalText;
-              break;
-            }
             const finalHtml = await this.finalResponseHtml(page, initialResponseTurnCount);
             const pendingAfterFinalize = mode.localTools
               ? Math.max(0, turn.pendingToolCount?.() ?? 0)
@@ -3383,6 +3383,12 @@ export class ChatGptBrowserWorker {
               completionTracker.reset();
               await waitForActivity(0, activePollingProfile.responseMs);
               continue;
+            }
+            if (mode.localTools && turn.hasBoundTurn && !turn.hasBoundTurn()) {
+              throw new Error(
+                `ChatGPT completed without binding connector ${JSON.stringify(this.config.appName)} to the active Codex environment. `
+                + "No native connection was established. Verify that this connector uses this desktop's tunnel and refresh its tools while the session is running.",
+              );
             }
             const final = markdownStream.finish(finalHtml);
             if (!final.markdown && snapshot.visibleTextLength > 0) {

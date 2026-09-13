@@ -35,6 +35,7 @@ export class ChatGptEventDecoder {
   private lastOperation = "append";
   private readonly emitted = new Map<string, string>();
   private readonly itemKinds = new Map<string, "commentary" | "final">();
+  private responseHasToolCalls = false;
   finalText = "";
   finalComplete = false;
 
@@ -85,7 +86,11 @@ export class ChatGptEventDecoder {
     const type = typeof value.type === "string" ? value.type : event;
     if (type === "response.output_item.added" && object(value.item)) {
       if (value.item.type === "message") this.itemKinds.set(value.item.id, value.item.phase === "commentary" ? "commentary" : "final");
-      else if (/^(?:function_call|custom_tool_call|mcp_call)$/.test(value.item.type ?? "")) this.diagnostics.count("received_tool_events");
+      else if (/^(?:function_call|custom_tool_call|mcp_call)$/.test(value.item.type ?? "")) {
+        this.responseHasToolCalls = true;
+        this.finalComplete = false;
+        this.diagnostics.count("received_tool_events");
+      }
       return;
     }
     if (type === "response.reasoning_summary_text.delta" && typeof value.delta === "string") {
@@ -100,10 +105,18 @@ export class ChatGptEventDecoder {
       return;
     }
     if (type === "response.completed") {
-      if (value.response?.end_turn !== false && this.finalText) this.finalComplete = true;
+      // A completed Responses *round* can hand control to tools. It does not
+      // prove that the outer task ended, even if assistant text preceded it.
+      const output = value.response?.output;
+      const hasToolCalls = this.responseHasToolCalls || (Array.isArray(output) && output.some((item: Json) =>
+        /^(?:function_call|custom_tool_call|mcp_call)$/.test(item?.type ?? "")));
+      this.finalComplete = !hasToolCalls && value.response?.end_turn !== false
+        && value.response?.status !== "incomplete" && this.finalText.length > 0;
       return;
     }
     if (type && /(?:function_call|tool_call|mcp_call)/.test(type)) {
+      this.responseHasToolCalls = true;
+      this.finalComplete = false;
       this.diagnostics.count("received_tool_events");
       return;
     }
@@ -113,6 +126,7 @@ export class ChatGptEventDecoder {
     const message = this.state.message;
     if (!object(message)) return;
     if (message.author?.role === "tool" || (message.recipient && message.recipient !== "all")) {
+      this.finalComplete = false;
       this.diagnostics.count("received_tool_events");
       return;
     }
@@ -180,6 +194,10 @@ export class ChatGptBrowserEventStream {
       const session = this.session = await page.context().newCDPSession(page);
       session.on("Network.responseReceived", ({ requestId, response }) => {
         if (!/text\/event-stream/i.test(response.mimeType)) return;
+        // A page may also have unrelated SSE subscriptions. Only the submitted
+        // conversation is allowed to provide completion evidence.
+        const url = new URL(response.url);
+        if (url.hostname !== "chatgpt.com" || !/^\/backend-api\/(?:f\/)?conversation(?:\/|$)/.test(url.pathname)) return;
         this.diagnostics.count("sse_responses");
         const events = new ChatGptEventDecoder(delta => {
           this.decoder = events;

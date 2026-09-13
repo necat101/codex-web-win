@@ -366,8 +366,8 @@ export function saveConfig(config: AppConfig): void {
 }
 
 export function providerConfig(config: AppConfig): CodexProviderConfig {
-  const models = ["gpt-5.6-sol"];
-  const efforts = ["low", "medium", "high", "xhigh", ...(config.proAvailable ? ["max"] : [])];
+  const models = ["gpt-5.6-luna", "gpt-5.6-sol"];
+  const solEfforts = ["medium", "high", "xhigh", ...(config.proAvailable ? ["max"] : [])];
   return {
     adapter: "chatgpt-web",
     baseUrl: "https://chatgpt.com",
@@ -376,8 +376,14 @@ export function providerConfig(config: AppConfig): CodexProviderConfig {
     defaultModel: "gpt-5.6-sol",
     contextWindow: config.contextWindow,
     modelInputModalities: Object.fromEntries(models.map(model => [model, ["text", "image"]])),
-    modelReasoningEfforts: { "gpt-5.6-sol": efforts },
-    modelDefaultReasoningEfforts: { "gpt-5.6-sol": "high" },
+    modelReasoningEfforts: {
+      "gpt-5.6-luna": ["low"],
+      "gpt-5.6-sol": solEfforts,
+    },
+    modelDefaultReasoningEfforts: {
+      "gpt-5.6-luna": "low",
+      "gpt-5.6-sol": "high",
+    },
     noReasoningModels: [],
     chatgptWeb: {
       appName: config.appName,

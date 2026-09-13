@@ -8,6 +8,7 @@ import { loginToDeepSeek } from "./deepseek-browser-login";
 import { getConfigDir, getConfigPath, loadConfig, loadConfigForSetup, saveConfig } from "./config";
 import { installCodexIntegration, uninstallCodexIntegration } from "./codex-integration";
 import { formatDoctorReport, runDoctor } from "./doctor";
+import { startLegacyCodexMcpHttpServer } from "./adapters/chatgpt-web/mcp-http";
 import { runChatGptMcpMain } from "./adapters/chatgpt-web/mcp-main";
 import { externalUrlOpenCommand, runCommand } from "./process";
 import { startServer } from "./server";
@@ -386,15 +387,20 @@ async function runForeground(config: ReturnType<typeof loadConfig>, ownTunnel: b
       initialAcceptingTurns: !waitsForTunnel,
     },
   );
+  let legacyMcp: Awaited<ReturnType<typeof startLegacyCodexMcpHttpServer>> | undefined;
   let tunnel: TunnelSession | undefined;
   let stoppingFor: NodeJS.Signals | "GUI" | undefined;
   try {
+    legacyMcp = await startLegacyCodexMcpHttpServer({ brokerSocketPath: config.brokerSocketPath });
     if (waitsForTunnel) {
       tunnel = await startTunnelSession(config);
       server.setAcceptingTurns(true);
     }
     stdout.write(
       `codex-chatgpt-web ${VERSION} listening on http://${config.host}:${server.port}/v1 (${config.mode})\n`,
+    );
+    stdout.write(
+      `Legacy Codex Native MCP compatibility listening on http://${legacyMcp.host}:${legacyMcp.port}${legacyMcp.path}\n`,
     );
     if (ownTunnel) {
       stdout.write("Foreground session owns the proxy, controlled Chrome, and full-mode tunnel. Press Ctrl+C to stop.\n");
@@ -404,6 +410,7 @@ async function runForeground(config: ReturnType<typeof loadConfig>, ownTunnel: b
     if (stoppingFor) stdout.write(`Stopping codex-chatgpt-web after ${stoppingFor}...\n`);
     const results = await Promise.allSettled([
       server.stop(true),
+      ...(legacyMcp ? [legacyMcp.stop()] : []),
       ...(tunnel ? [tunnel.stop()] : []),
     ]);
     const failures = results

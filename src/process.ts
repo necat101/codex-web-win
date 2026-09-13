@@ -1,5 +1,27 @@
 import { spawn, spawnSync, type SpawnOptions, type SpawnSyncOptions } from "node:child_process";
-import { join } from "node:path";
+import { accessSync, constants, statSync } from "node:fs";
+import { delimiter, extname, join } from "node:path";
+
+/** Resolve a PATH executable without relying on the build-time Bun runtime. */
+export function findExecutable(name: string, environment: NodeJS.ProcessEnv = process.env): string | undefined {
+  const envValue = (key: string) => Object.entries(environment).find(([candidate]) => (
+    process.platform === "win32" ? candidate.toLowerCase() === key.toLowerCase() : candidate === key
+  ))?.[1];
+  const extensions = process.platform === "win32" && !extname(name)
+    ? (envValue("PATHEXT") ?? ".COM;.EXE;.BAT;.CMD").split(";").filter(Boolean)
+    : [""];
+  for (const directory of (envValue("PATH") ?? "").split(delimiter).filter(Boolean)) {
+    for (const extension of extensions) {
+      const candidate = join(directory.replace(/^"(.*)"$/, "$1"), name + extension);
+      try {
+        if (!statSync(candidate).isFile()) continue;
+        accessSync(candidate, process.platform === "win32" ? constants.F_OK : constants.X_OK);
+        return candidate;
+      } catch { /* Missing or inaccessible PATH entries are normal. */ }
+    }
+  }
+  return undefined;
+}
 
 export interface CommandResult {
   status: number;

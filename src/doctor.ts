@@ -8,6 +8,7 @@ import {
   deepSeekLoginVerificationMarkerPath,
 } from "./deepseek-browser-login";
 import { getServiceStatus } from "./service";
+import { findExecutable } from "./process";
 import {
   installedTunnelClientBuildId,
   installedTunnelClientVersion,
@@ -96,8 +97,8 @@ export async function runDoctor(): Promise<DoctorReport> {
   } else {
     checks.push({ id: "chrome", status: "ok", message: `Chrome executable found: ${config.chromeExecutablePath}` });
   }
-  const ffmpegPath = Bun.which("ffmpeg");
-  const ffprobePath = Bun.which("ffprobe");
+  const ffmpegPath = findExecutable("ffmpeg");
+  const ffprobePath = findExecutable("ffprobe");
   if (ffmpegPath && ffprobePath) {
     checks.push({
       id: "media-tools",

@@ -532,7 +532,7 @@ export function waitCellInvocationArgs(options: {
   };
 }
 
-export async function runChatGptMcpServer(options: { brokerSocketPath: string }): Promise<void> {
+export function createChatGptMcpServer(options: { brokerSocketPath: string }): McpServer {
   const server = new McpServer({ name: "codex-native", version: "4.0.0" });
   // A connector/session id is broader than one Codex turn. In redundant
   // same-tunnel deployments the same ChatGPT session can legitimately dispatch
@@ -1098,6 +1098,10 @@ export async function runChatGptMcpServer(options: { brokerSocketPath: string })
     },
   );
 
+  return server;
+}
+
+export async function runChatGptMcpServer(options: { brokerSocketPath: string }): Promise<void> {
   // tunnel-client owns this subprocess's stdio. During a tunnel recycle it can
   // close stdout while an MCP response is in flight; Node otherwise treats the
   // resulting EPIPE as an unhandled stream error and prints a crash stack. There
@@ -1108,6 +1112,7 @@ export async function runChatGptMcpServer(options: { brokerSocketPath: string })
     throw error;
   };
   process.stdout.on("error", onStdoutError);
+  const server = createChatGptMcpServer(options);
   // `connect()` resolves once the transport is started; it does not represent
   // the transport's full lifetime. Keep the listener installed for the process
   // lifetime so a later dispatcher-side pipe close is handled as well.

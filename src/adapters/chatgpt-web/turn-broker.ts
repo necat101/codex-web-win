@@ -195,6 +195,10 @@ export class TurnBroker {
     return channel.invocations.size;
   }
 
+  isBound(token: string): boolean {
+    return this.channels.get(token)?.bindingId !== undefined;
+  }
+
   async waitForPendingToolCountChange(
     token: string,
     previousCount: number,

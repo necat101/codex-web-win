@@ -110,7 +110,7 @@ export class HttpTurnCounter {
 
 export function routeChatGptWebRequest(parsed: CodexParsedRequest, config: AppConfig): ChatGptWebModelRoute {
   const route = requireChatGptWebModelRoute(parsed.modelId, config.proAvailable);
-  parsed.modelId = CHATGPT_WEB_BACKEND_MODEL;
+  parsed.modelId = route.backendModel;
   parsed.options.reasoning = route.adapterEffort;
   return route;
 }
