@@ -442,7 +442,7 @@ export function createChatGptWebAdapter(provider: CodexProviderConfig): Provider
           return;
         }
         emit({ type: "heartbeat" });
-      }, 10_000);
+      }, 2_000);
       try {
         emit({ type: "heartbeat" });
         await session.runExclusive(async () => {

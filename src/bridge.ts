@@ -193,9 +193,11 @@ export function bridgeToResponsesSSE(
       });
 
       const heartbeatFrame = encoder.encode('event: response.heartbeat\ndata: {"type":"response.heartbeat"}\n\n');
-      let stallTicks = 0;
       const stallSec = resolveStallTimeoutSec(options?.stallTimeoutSec);
-      const maxStallTicks = Math.ceil((stallSec * 1000) / heartbeatMs);
+      const stallTimeoutMs = stallSec === undefined
+        ? undefined
+        : stallSec * 1000;
+      let lastUpstreamActivityAt = Date.now();
 
       let currentMsg: { itemId: string; outputIndex: number; text: string; phase?: CodexMessagePhase } | null = null;
       let currentReasoning: { itemId: string; outputIndex: number; text: string } | null = null;
@@ -435,16 +437,23 @@ export function bridgeToResponsesSSE(
         if (stepping || closed) return;
         stepping = true;
         gated = false;
+        // Time spent gated by downstream backpressure is not an upstream stall.
+        // Start a fresh silence budget when we actually resume waiting on the adapter.
+        lastUpstreamActivityAt = Date.now();
         const emittedAtStart = emittedFrames;
         try {
         while (!terminated && !closed && emittedFrames === emittedAtStart) {
           iteratorStarted = true;
           const next = await it.next();
+          // Cancellation/watchdog termination can win while next() is pending.
+          // Never persist a late completed response for an already closed turn.
+          if (closed || terminated) { stepping = false; return; }
           if (next.done) { upstreamDone = true; break; }
           const event = next.value;
           let terminalEvent = false;
-          activity = true;
-          stallTicks = 0;
+          // Only emitted frames count as downstream activity (see emit()). Hidden
+          // reasoning/compaction deltas must not suppress the client's keepalive.
+          lastUpstreamActivityAt = Date.now();
           reportFirstOutput(event);
           // Compaction turns emit ONLY the synthetic compaction item + response.completed. The
           // summary text is accumulated silently: emitting it as a normal assistant message would
@@ -456,6 +465,15 @@ export function bridgeToResponsesSSE(
             if (event.type !== "done" && event.type !== "incomplete" && event.type !== "error") continue;
           }
           switch (event.type) {
+            case "heartbeat": {
+              // Adapter heartbeats prove the upstream turn is still alive. Forward a real,
+              // parser-ignored SSE frame so Codex observes that liveness too; otherwise the
+              // adapter can keep resetting our internal stall counter while the client sees
+              // no bytes and independently reconnects or times out.
+              controller.enqueue(heartbeatFrame);
+              emittedFrames++;
+              break;
+            }
             case "assistant_boundary": {
               // A guarded continuation starts a fresh assistant output item while keeping the
               // intermediate, suspicious text in the same Responses turn.
@@ -740,7 +758,7 @@ export function bridgeToResponsesSSE(
           }
         }
       } catch (err) {
-        if (!terminated) {
+        if (!terminated && !closed) {
           flushHiddenRawReasoning();
           if (currentWebSearch) closeCurrentWebSearch("failed", []);
           emit("response.failed", {
@@ -801,9 +819,8 @@ export function bridgeToResponsesSSE(
         // queue, pull stepping pauses; no custom FIFO or queuing strategy is layered on top.
         gated = true;
         beat = setInterval(() => {
-          if (closed || gated) return;
-          if (activity) { activity = false; stallTicks = 0; return; }
-          if (++stallTicks >= maxStallTicks) {
+          if (closed) return;
+          if (!gated && stallTimeoutMs !== undefined && Date.now() - lastUpstreamActivityAt >= stallTimeoutMs) {
             if (currentMsg) closeCurrentMessage();
             if (currentReasoning) closeCurrentReasoning();
             if (currentRawReasoning) closeCurrentRawReasoning();
@@ -827,6 +844,7 @@ export function bridgeToResponsesSSE(
             closed = true;
             return;
           }
+          if (activity) { activity = false; return; }
           try {
             controller.enqueue(heartbeatFrame);
             emittedFrames++;
