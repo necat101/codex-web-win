@@ -32,7 +32,9 @@ function Show-Message {
     [string]$Title,
     [System.Windows.Forms.MessageBoxIcon]$Icon = [System.Windows.Forms.MessageBoxIcon]::Information
   )
-  if (-not $Quiet) {
+  if ($Quiet -and $Icon -eq [System.Windows.Forms.MessageBoxIcon]::Error) {
+    [Console]::Error.WriteLine($Text)
+  } elseif (-not $Quiet) {
     [System.Windows.Forms.MessageBox]::Show(
       $Text,
       $Title,

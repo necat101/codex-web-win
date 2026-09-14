@@ -2,11 +2,16 @@ import { createHash } from "node:crypto";
 import {
   existsSync,
   mkdtempSync,
+  mkdirSync,
   readFileSync,
   rmSync,
+  writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir } from "node:os";
 import { basename, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { createServer } from "node:net";
+import { defaultConfig } from "../src/config";
+import { verifyRuntimeStreaming } from "./verify-runtime-streaming";
 
 interface CommandResult {
   exitCode: number;
@@ -216,7 +221,10 @@ if (process.platform !== "win32") {
 assert(packageVersion, "package.json has no version");
 assert(existsSync(setupPath), `Windows offline setup does not exist: ${setupPath}`);
 
-const tempBase = resolve(tmpdir());
+// Config validation intentionally rejects executable paths under OS Temp.
+// A disposable, owned directory under the profile exercises real setup and
+// uninstall validation without adding a test-only escape hatch to the runtime.
+const tempBase = resolve(homedir());
 const root = mkdtempSync(join(tempBase, smokePrefix));
 const alternateProfile = join(root, "Profiles", "Morgan Example \u03a9");
 const binDir = join(alternateProfile, "Local App Data", "Programs", "Codex ChatGPT Web", "bin");
@@ -350,6 +358,50 @@ try {
   assert(version.exitCode === 0, `installed launcher --version failed (${version.exitCode}): ${version.stderr}`);
   assert(version.stdout === `${packageVersion}\n`, `installed launcher stdout was not exactly ${JSON.stringify(`${packageVersion}\n`)}: ${JSON.stringify(version.stdout)}`);
   assert(version.stderr === "", `installed launcher --version wrote to stderr: ${version.stderr}`);
+
+  // Reproduce the user's same-version uninstall/keep-data/reinstall workflow.
+  // Use synthetic private data and an isolated Codex home, never a real login.
+  const portProbe = createServer();
+  await new Promise<void>(resolve => portProbe.listen(0, "127.0.0.1", resolve));
+  const portAddress = portProbe.address();
+  assert(portAddress && typeof portAddress !== "string", "could not reserve a fixture port");
+  const fixturePort = portAddress.port;
+  await new Promise<void>(resolve => portProbe.close(() => resolve()));
+  const configPath = join(appHome, "config.json");
+  const storagePath = join(appHome, "browser", "storage-state.json");
+  mkdirSync(join(appHome, "browser"), { recursive: true });
+  const retainedConfig = JSON.stringify({
+    ...defaultConfig(), mode: "browser-only", port: fixturePort,
+    runtimeCommand: [join(installedRuntime, "runtime", "node.exe"), join(installedRuntime, "app", "cli.js")],
+    storageStatePath: storagePath,
+    brokerSocketPath: join(appHome, "runtime", "broker.sock"),
+    stallTimeoutSec: 90,
+  });
+  const retainedStorage = '{"cookies":[],"origins":[]}\n';
+  writeFileSync(configPath, retainedConfig);
+  writeFileSync(storagePath, retainedStorage);
+  const retainedEnvironment = { ...environment, CODEX_HOME: join(root, "isolated-codex"), CODEX_CHATGPT_WEB_HOME: appHome };
+  const uninstallPath = join(binDir, "codex-chatgpt-web-uninstall.ps1");
+  const uninstall = await run(powershellPath(), ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", uninstallPath,
+    "-Yes", "-KeepData", "-Quiet"], { env: retainedEnvironment, timeoutMs: 60_000 });
+  assert(uninstall.exitCode === 0, `keep-data uninstall failed: ${uninstall.stderr || uninstall.stdout}`);
+  const cleanupDeadline = Date.now() + 15_000;
+  while (existsSync(uninstallPath) && Date.now() < cleanupDeadline) await Bun.sleep(100);
+  assert(!existsSync(uninstallPath), "uninstall cleanup did not finish before reinstall");
+  assert(readFileSync(configPath, "utf8") === retainedConfig, "keep-data uninstall changed configuration");
+  assert(readFileSync(storagePath, "utf8") === retainedStorage, "keep-data uninstall changed browser data");
+  const reinstall = await run(setupPath, ["--quiet", "--no-launch", "--no-path", "--no-shortcuts", "--no-register",
+    "--bin-dir", binDir, "--lib-dir", libDir, "--doc-dir", docDir, "--app-home", appHome],
+  { env: retainedEnvironment, timeoutMs: 120_000 });
+  assert(reinstall.exitCode === 0, `retained-data reinstall failed: ${reinstall.stderr || reinstall.stdout}`);
+  assert(readFileSync(configPath, "utf8") === retainedConfig, "reinstall changed retained configuration");
+  assert(readFileSync(storagePath, "utf8") === retainedStorage, "reinstall changed retained browser data");
+  const reinstalledManifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+  const installedHash = createHash("sha256").update(readFileSync(join(installedRuntime, "app", "cli.js"))).digest("hex");
+  assert(installedHash === reinstalledManifest.entrypointSha256, "reinstall selected a stale runtime");
+  await verifyRuntimeStreaming(projectRoot, installedRuntime);
+  assert(await captureUserIntegrationState() === integrationBefore, "retained-data smoke changed user integration");
+  process.stdout.write("WINDOWS_KEEP_DATA_REINSTALL_STREAMING_OK\n");
 
   const evidenceHash = createHash("sha256")
     .update(launcherSidecar.raw)

@@ -1,6 +1,8 @@
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
+import { assertRuntimeProvenance } from "./runtime-provenance";
+import { verifyRuntimeStreaming } from "./verify-runtime-streaming";
 
 if (process.platform !== "win32") {
   throw new Error("The offline Windows installer must be built on Windows");
@@ -19,6 +21,8 @@ if (!existsSync(manifestPath)) {
   throw new Error(`Runtime manifest is missing: ${manifestPath}`);
 }
 const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as Record<string, unknown>;
+assertRuntimeProvenance(root, runtimeRoot);
+await verifyRuntimeStreaming(root, runtimeRoot);
 const tunnelClientTarget = process.arch === "arm64" ? "windows-arm64" : "windows-amd64";
 const tunnelClientPath = "vendor/tunnel-client/tunnel-client.exe";
 if (manifest.platform !== "win32"

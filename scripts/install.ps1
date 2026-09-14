@@ -635,6 +635,12 @@ try {
     throw "Windows runtime archive is incomplete"
   }
   $manifest = Get-Content -Raw -LiteralPath $manifestPath | ConvertFrom-Json
+  if ($manifest.entrypointSha256) {
+    $actualEntrypointHash = Get-Sha256Hex -Path (Join-Path $stageDir 'app\cli.js')
+    if ($actualEntrypointHash -cne $manifest.entrypointSha256) {
+      throw 'Runtime cli.js does not match its build fingerprint'
+    }
+  }
   $expectedTunnelTarget = if ($assetArchitecture -eq "arm64") { "windows-arm64" } else { "windows-amd64" }
   if ($manifest.schemaVersion -ne 1 -or $manifest.appVersion -ne $Version -or
       $manifest.platform -ne "win32" -or $manifest.arch -ne $assetArchitecture -or

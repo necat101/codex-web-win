@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { chmodSync, copyFileSync, cpSync, existsSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { VERSION } from "../src/version";
+import { fileSha256, sourceSha256 } from "./runtime-provenance";
 import {
   buildNoExpiryTunnelClient,
   TUNNEL_CLIENT_BUILD_ID,
@@ -245,6 +246,9 @@ writeFileSync(join(output, "manifest.json"), `${JSON.stringify({
     tunnelClientSha256: tunnelClient!.sha256,
   } : {}),
   entrypoint: "app/cli.js",
+  builtAt: new Date().toISOString(),
+  sourceSha256: sourceSha256(root),
+  entrypointSha256: fileSha256(join(appDir, "cli.js")),
   playwright: JSON.parse(readFileSync(playwrightPackage, "utf8")).version,
 }, null, 2)}\n`);
 
