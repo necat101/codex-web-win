@@ -247,7 +247,6 @@ async function localCompactionV2Response(
     { type: "done" },
   ];
   const maps = toolBridgeMaps(parsed);
-
   if (parsed.stream) {
     const queue = new AsyncEventQueue<AdapterEvent>();
     for (const event of events) queue.push(event);
@@ -309,6 +308,25 @@ async function localCompactionMessageResponse(
     { type: "done" },
   ];
   const maps = toolBridgeMaps(parsed);
+  const rememberCompactionContinuation = (response: { id?: unknown }): void => {
+    // The native/local compactor consumes an ordinary assistant message, but a
+    // following Responses request may still continue by previous_response_id
+    // instead of replaying the replacement summary inline. Persist a shadow
+    // response under the same id using the synthetic compaction-item contract
+    // so state expansion installs the bounded manifest as replacement history
+    // rather than resurrecting the entire pre-compaction request.
+    const stateResponse = {
+      ...buildResponseJSON(events, route.slug, {
+        hideThinkingSummary: true,
+        toolNsMap: maps.toolNsMap,
+        freeformToolNames: maps.freeformToolNames,
+        toolSearchToolNames: maps.toolSearchToolNames,
+        compaction: true,
+      }),
+      ...(typeof response.id === "string" ? { id: response.id } : {}),
+    };
+    rememberResponseState(parsed._rawBody, stateResponse, { force: true });
+  };
 
   if (parsed.stream) {
     const queue = new AsyncEventQueue<AdapterEvent>();
@@ -327,6 +345,7 @@ async function localCompactionMessageResponse(
         // Codex's local auto-compactor consumes ordinary assistant text. A synthetic compaction
         // item is reserved for the separate remote-v2 compaction_trigger contract.
         compaction: false,
+        onCompletedResponse: rememberCompactionContinuation,
       },
     );
     return new Response(stream, {
@@ -346,8 +365,7 @@ async function localCompactionMessageResponse(
     toolSearchToolNames: maps.toolSearchToolNames,
     compaction: false,
   });
-  // Do not retain this large internal summarizer exchange in previous_response_id state. Codex
-  // installs its answer as replacement history and the next request starts a fresh replay epoch.
+  rememberCompactionContinuation(json);
   return Response.json(json);
 }
 

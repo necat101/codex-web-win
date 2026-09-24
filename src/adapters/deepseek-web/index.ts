@@ -235,11 +235,11 @@ export function createDeepSeekWebAdapter(provider: CodexProviderConfig): Provide
         const prompt = compileDeepSeekWebPrompt(parsed, { contextKey: conversationKey });
         const traceId = deepSeekTraceId(parsed, route.slug, prompt.text);
         const continuationPrompt = conversationKey
-          ? compileDeepSeekWebContinuationPrompt(parsed)
+          ? compileDeepSeekWebContinuationPrompt(parsed, { contextKey: conversationKey })
           : undefined;
         const continueFromTraceId = deepSeekToolContinuationTraceId(parsed);
         const followUpPrompt = continueFromTraceId
-          ? compileDeepSeekWebFollowUpPrompt(parsed, continueFromTraceId)
+          ? compileDeepSeekWebFollowUpPrompt(parsed, continueFromTraceId, { contextKey: conversationKey })
           : undefined;
         const toolCapable = deepSeekEffectiveTools(parsed).length > 0;
         const toolRequired = deepSeekToolCallRequired(parsed);

@@ -229,6 +229,15 @@ export class ChatGptTurnDomHealthTracker {
   private probeFailureSince?: number;
   private lastObservedAt?: number;
 
+  /** Local tools suspend response-completion observation, including its clocks. */
+  pauseForTools(): void {
+    this.missingResponseSince = undefined;
+    this.runningWithoutResponseSince = undefined;
+    this.emptyCompletionSince = undefined;
+    this.probeFailureSince = undefined;
+    this.lastObservedAt = undefined;
+  }
+
   constructor(
     private readonly missingResponseMs = CHATGPT_RESPONSE_DOM_GRACE_MS,
     private readonly emptyCompletionMs = CHATGPT_EMPTY_RESPONSE_GRACE_MS,
@@ -250,7 +259,8 @@ export class ChatGptTurnDomHealthTracker {
     running: boolean;
     currentText: string;
     completionActionPresent: boolean;
-    probeSucceeded?: boolean;
+      probeSucceeded?: boolean;
+      probeError?: string;
   }, now = Date.now()): string | undefined {
     // A watchdog deadline is valid only while failed observations are
     // continuous. Pending tools, renderer stalls, and sleep/resume all create
@@ -267,7 +277,8 @@ export class ChatGptTurnDomHealthTracker {
     if (state.probeSucceeded === false) {
       this.probeFailureSince ??= now;
       if (now - this.probeFailureSince >= this.probeFailureMs) {
-        return "ChatGPT browser response could not be inspected continuously";
+        return "ChatGPT browser response could not be inspected continuously"
+          + (state.probeError ? ` (${state.probeError})` : "");
       }
       return undefined;
     }
@@ -338,6 +349,7 @@ export interface ChatGptVisibleTraceEvent {
 
 interface ChatGptResponseDomSnapshot {
   probeSucceeded: boolean;
+  probeError?: string;
   responsePresent: boolean;
   running: boolean;
   deliveryTimeoutPresent: boolean;
@@ -2787,15 +2799,21 @@ export class ChatGptBrowserWorker {
     scanRecoverySignals: boolean,
     scanTraceBlocks: boolean,
     pendingToolCount = 0,
+    basicProbe = false,
   ): Promise<ChatGptResponseDomSnapshot> {
-    const snapshot = await page.evaluate(({ maxTraceCandidates, responseIndex, scanRecoverySignals, scanTraceBlocks, pendingToolCount }) => {
+    const snapshot = await page.evaluate(({ maxTraceCandidates, responseIndex, scanRecoverySignals, scanTraceBlocks, pendingToolCount, basicProbe }) => {
       const visible = (candidate: HTMLElement): boolean => {
-        if (typeof candidate.checkVisibility === "function") {
-          return candidate.checkVisibility({
-            checkOpacity: true,
-            checkVisibilityCSS: true,
-            contentVisibilityAuto: true,
-          });
+        if (!basicProbe && typeof candidate.checkVisibility === "function") {
+          try {
+            return candidate.checkVisibility({
+              checkOpacity: true,
+              checkVisibilityCSS: true,
+              contentVisibilityAuto: true,
+            });
+          } catch {
+            // A browser/API incompatibility must not discard the entire
+            // response snapshot. The layout check below works on older Chrome.
+          }
         }
         const style = getComputedStyle(candidate);
         const rect = candidate.getBoundingClientRect();
@@ -2960,8 +2978,30 @@ export class ChatGptBrowserWorker {
       scanRecoverySignals,
       scanTraceBlocks,
       pendingToolCount,
+      basicProbe,
     }).then(value => ({ ...value, probeSucceeded: true } satisfies ChatGptResponseDomSnapshot))
-      .catch(() => absentResponseDomSnapshot(false));
+      .catch(async error => {
+        const message = error instanceof Error ? error.message : String(error);
+        // These states cannot be repaired by polling the same dead Page for
+        // five minutes. Do not reload/resubmit a Temporary Chat with live tools.
+        if (page.isClosed() || /target (?:page, context or browser|closed)|browser (?:has been )?closed/i.test(message)) {
+          throw new Error("ChatGPT browser page or connection closed while the response was running");
+        }
+        if (/page crashed|target crashed/i.test(message)) {
+          throw new Error("ChatGPT browser page crashed while the response was running");
+        }
+        if (!basicProbe) {
+          // Retry a read only, on the same page, without optional transcript
+          // scans. This also recovers a transient destroyed execution context.
+          return this.responseDomSnapshot(page, responseIndex, false, false, pendingToolCount, true);
+        }
+        const probeError = /execution context|navigation/i.test(message) ? "browser navigation interrupted inspection"
+          : /timeout|timed out/i.test(message) ? "browser inspection timed out"
+          : /ReferenceError/i.test(message) ? "browser inspection script ReferenceError"
+          : /TypeError/i.test(message) ? "browser inspection script TypeError"
+          : "browser evaluation failed";
+        return { ...absentResponseDomSnapshot(false), probeError };
+      });
     snapshot.traceBlocks = snapshot.traceBlocks.filter(block => !isChatGptTraceControl(block));
     return snapshot;
   }
@@ -3223,6 +3263,10 @@ export class ChatGptBrowserWorker {
           : 0;
         if (pendingToolCount > 0) {
           completionTracker.reset();
+          // Failed response reads separated by real tool execution are not
+          // continuous failures, even when the tool takes less than the normal
+          // observation-gap threshold. Start a fresh grace after tool results.
+          domHealthTracker.pauseForTools();
           if (previousPendingToolCount === 0 || Date.now() >= nextTraceScanAt) {
             // A tool invocation can arrive immediately after a short Markdown
             // progress message. The normal pending-tool fast path used to skip
@@ -3339,6 +3383,7 @@ export class ChatGptBrowserWorker {
             currentText: snapshot.visibleTextLength > 0 ? "present" : "",
             completionActionPresent: snapshot.completionActionPresent || eventStream.decoder.finalComplete,
             probeSucceeded: snapshot.probeSucceeded,
+            probeError: snapshot.probeError,
           });
           if (domError) throw new Error(domError);
           const completionState = {
@@ -3418,6 +3463,7 @@ export class ChatGptBrowserWorker {
             currentText: "",
             completionActionPresent: false,
             probeSucceeded: snapshot.probeSucceeded,
+            probeError: snapshot.probeError,
           });
           if (domError) throw new Error(domError);
 

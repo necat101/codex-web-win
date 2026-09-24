@@ -136,6 +136,7 @@ export function deepSeekToolContinuationTraceId(parsed: CodexParsedRequest): str
 export function compileDeepSeekWebFollowUpPrompt(
   parsed: CodexParsedRequest,
   traceId: string,
+  options: DeepSeekWebPromptCompileOptions = {},
 ): CompiledDeepSeekWebPrompt | undefined {
   const results = trailingToolResults(parsed);
   if (results.length === 0 || results.some(result => result.toolCallId.match(DEEPSEEK_TOOL_CALL_ID)?.[1] !== traceId)) {
@@ -155,6 +156,9 @@ export function compileDeepSeekWebFollowUpPrompt(
     blocks.push("Return only the requested JSON value, without a Markdown fence or surrounding prose.");
   }
   const text = blocks.join("\n\n");
+  if (text.length > (options.pasteBudgetChars ?? DEEPSEEK_WEB_PROMPT_CHAR_BUDGET)) {
+    return compileDeepSeekWebPrompt(parsed, options);
+  }
   return { text, sourceChars: text.length };
 }
 
@@ -176,6 +180,7 @@ function lastAssistantBoundary(parsed: CodexParsedRequest): number {
  */
 export function compileDeepSeekWebContinuationPrompt(
   parsed: CodexParsedRequest,
+  options: DeepSeekWebPromptCompileOptions = {},
 ): CompiledDeepSeekWebPrompt | undefined {
   const boundary = lastAssistantBoundary(parsed);
   if (boundary < 0) return undefined;
@@ -195,6 +200,9 @@ export function compileDeepSeekWebContinuationPrompt(
     blocks.push("Return only the requested JSON value, without a Markdown fence or surrounding prose.");
   }
   const text = blocks.join("\n\n");
+  if (text.length > (options.pasteBudgetChars ?? DEEPSEEK_WEB_PROMPT_CHAR_BUDGET)) {
+    return compileDeepSeekWebPrompt(parsed, options);
+  }
   return { text, sourceChars: text.length };
 }
 

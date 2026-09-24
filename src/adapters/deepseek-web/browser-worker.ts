@@ -487,39 +487,79 @@ export class DeepSeekBrowserWorker {
 
   private async selectMode(page: Page, mode: DeepSeekWebAdapterMode): Promise<void> {
     const desired = mode === "expert" ? "Expert" : "Instant";
+    const desiredDeepThink = mode === "expert";
     const desiredPattern = mode === "expert"
       ? /^Expert(?:\s+Mode)?$/i
       : /^Instant(?:\s+Mode)?$/i;
-    const findDesired = async () => {
-      const radios = page.locator('div[role="radio"]');
-      const count = await radios.count();
+    const findControl = async (selector: string, pattern: RegExp) => {
+      const controls = page.locator(selector);
+      const count = await controls.count();
       for (let index = 0; index < count; index++) {
-        const radio = radios.nth(index);
-        if (!await radio.isVisible().catch(() => false)) continue;
+        const control = controls.nth(index);
+        if (!await control.isVisible().catch(() => false)) continue;
         const fields = [
-          await radio.getAttribute("aria-label").catch(() => null),
-          await radio.getAttribute("title").catch(() => null),
-          await radio.innerText().catch(() => ""),
+          await control.getAttribute("aria-label").catch(() => null),
+          await control.getAttribute("title").catch(() => null),
+          await control.innerText().catch(() => ""),
         ];
-        if (fields.some(field => desiredPattern.test((field ?? "").replace(/\s+/g, " ").trim()))) {
-          return radio;
+        if (fields.some(field => pattern.test((field ?? "").replace(/\s+/g, " ").trim()))) {
+          return control;
         }
       }
       return undefined;
     };
+    const findDeepThink = () => findControl(
+      '[aria-pressed]',
+      /^DeepThink(?:\s+(?:Mode|R1)|\s*\([^)]*\))?$/i,
+    );
+    const findSearch = () => findControl('[aria-pressed]', /^Search$/i);
+    const findDesiredRadio = () => findControl('[role="radio"]', desiredPattern);
+
+    const setToggle = async (
+      label: string,
+      find: () => ReturnType<typeof findControl>,
+      expectedPressed: boolean,
+    ): Promise<boolean> => {
+      const control = await find();
+      if (!control) return false;
+      const expected = expectedPressed ? "true" : "false";
+      if (await control.getAttribute("aria-pressed").catch(() => null) === expected) return true;
+      await control.click({ timeout: 15_000 });
+      const deadline = Date.now() + 15_000;
+      while (Date.now() < deadline) {
+        const current = await find();
+        if (current && await current.getAttribute("aria-pressed").catch(() => null) === expected) return true;
+        await page.waitForTimeout(250);
+      }
+      throw new Error(`DeepSeek Web did not confirm ${label} ${expectedPressed ? "enabled" : "disabled"}`);
+    };
 
     const discoveryDeadline = Date.now() + 30_000;
-    let target = await findDesired();
-    while (!target && Date.now() < discoveryDeadline) {
+    let deepThink = await findDeepThink();
+    let target = deepThink ? undefined : await findDesiredRadio();
+    while (!deepThink && !target && Date.now() < discoveryDeadline) {
       await page.waitForTimeout(250);
-      target = await findDesired();
+      deepThink = await findDeepThink();
+      if (!deepThink) target = await findDesiredRadio();
     }
+
+    // The current DeepSeek composer exposes DeepThink/Search toggles rather
+    // than the older Instant/Expert radio group. Keep our harness-facing mode
+    // names stable by mapping Instant -> DeepThink off and Expert -> on. Search
+    // is a separate persisted browser preference, so force it off to prevent a
+    // prior interactive session from silently changing Codex turn semantics.
+    if (deepThink) {
+      await setToggle("DeepThink", findDeepThink, desiredDeepThink);
+      await setToggle("Search", findSearch, false);
+      return;
+    }
+
     if (!target) throw new Error(`DeepSeek Web UI contract drift: visible ${desired} mode radio was not found`);
     if (await target.getAttribute("aria-checked") === "true") return;
     await target.click({ timeout: 15_000 });
     const deadline = Date.now() + 15_000;
     while (Date.now() < deadline) {
-      const current = await findDesired();
+      const current = await findDesiredRadio();
       if (current && await current.getAttribute("aria-checked").catch(() => null) === "true") return;
       await page.waitForTimeout(250);
     }
@@ -921,6 +961,11 @@ export class DeepSeekBrowserWorker {
     };
     turn.abortSignal?.addEventListener("abort", onAbort, { once: true });
     try {
+      // An abort during browser startup predates the listener registration.
+      if (turn.abortSignal?.aborted || this.closed) {
+        onAbort();
+        throw abortError();
+      }
       let activePrompt = turn.prompt;
       const exactToolContinuation = Boolean(
         turn.continueFromTraceId
@@ -964,6 +1009,7 @@ export class DeepSeekBrowserWorker {
       }
 
       await this.insertPrompt(page, activePrompt);
+      if (turn.abortSignal?.aborted || this.closed || this.cancelledContexts.has(context)) throw abortError();
       // Pressing Enter crosses the no-duplicate boundary. Even if the UI does
       // not subsequently expose a user bubble, DeepSeek may already have
       // accepted the request.
@@ -1079,8 +1125,14 @@ export class DeepSeekBrowserWorker {
     } finally {
       turn.abortSignal?.removeEventListener("abort", onAbort);
       if (completed && !page.isClosed() && !deepSeekSignInUrl(page.url())) {
-        const state = await context.storageState().catch(() => undefined);
-        if (state) atomicWriteFile(this.config.storageStatePath, `${JSON.stringify(state)}\n`);
+        try {
+          const state = await context.storageState();
+          atomicWriteFile(this.config.storageStatePath, `${JSON.stringify(state)}\n`);
+        } catch {
+          // The response already completed. Preserve its replay-cache outcome
+          // even if refreshing login state fails (for example a locked file).
+          console.warn("[deepseek-web] Could not refresh saved login state after a completed turn");
+        }
       }
       this.cancelledContexts.delete(context);
       if (this.activeContext === context) this.activeContext = undefined;
