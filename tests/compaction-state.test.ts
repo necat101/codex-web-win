@@ -476,6 +476,36 @@ describe("ChatGPT Web compaction continuation", () => {
     expect(tail.text).toContain("-end");
   });
 
+  test("restores a local checkpoint through previous_response_id", async () => {
+    const response = await responseRequest(new Request("http://127.0.0.1/v1/responses", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "chatgpt-web/high",
+        stream: false,
+        input: [
+          { type: "message", id: "msg_old", role: "user", content: [{ type: "input_text", text: "old context" }] },
+          { type: "message", role: "user", content: [{ type: "input_text", text: COMPACT_PROMPT }] },
+        ],
+        tools: [],
+      }),
+    }), browserOnlyConfig());
+    const body = await response.json() as { id?: string };
+    expect(response.status).toBe(200);
+    expect(typeof body.id).toBe("string");
+
+    const expanded = expandPreviousResponseInput({
+      model: "chatgpt-web/high",
+      previous_response_id: body.id,
+      input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "new work" }] }],
+    }) as { input: unknown[] };
+    const serialized = JSON.stringify(expanded.input);
+    expect(serialized).toContain("\"type\":\"compaction\"");
+    expect(serialized).toContain("new work");
+    expect(serialized).not.toContain("old context");
+    expect(JSON.stringify(parseRequest(expanded).context.messages)).toContain("CODEX_BRIDGE_LOCAL_COMPACTION");
+  });
+
   test("bounds the restart continuation cache while preserving the newest response", async () => {
     const harnessHome = activeHarnessHome();
     const payload = "x".repeat(450_000);

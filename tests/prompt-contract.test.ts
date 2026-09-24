@@ -28,6 +28,9 @@ describe("ChatGPT Web transport contract", () => {
     expect(compiled.text).toContain("__bridge_read_compaction");
     expect(compiled.text).toContain("CODEX_SHARED_TUNNEL_ROUTE_MISS");
     expect(compiled.text).toContain("up to 8 additional times");
+    expect(compiled.text).toContain("outer dispatch refusal");
+    expect(compiled.text).toContain("report the failing layer accurately");
+    expect(compiled.text).toContain("Do not substitute remote repository inspection for required local execution");
     expect(compiled.text).toContain("Send task-facing progress commentary while working and a final answer when finished.");
     expect(compiled.text.length).toBeLessThan(5_200);
   });

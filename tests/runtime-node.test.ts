@@ -8,6 +8,7 @@ import { smokeNativeMcp } from "../scripts/smoke-native-mcp";
 
 const scratch = mkdtempSync(join(tmpdir(), "codex-node-regression-"));
 const bundle = join(scratch, "cli.mjs");
+const browserSmoke = join(scratch, "browser-inspection.mjs");
 const node = findExecutable("node");
 
 beforeAll(async () => {
@@ -15,6 +16,10 @@ beforeAll(async () => {
   const build = await Bun.build({ entrypoints: [resolve("src/cli.ts")], target: "node", packages: "bundle", minify: true,
     external: ["playwright-core"], outdir: scratch, naming: "cli.mjs" });
   expect(build.success).toBe(true);
+  const inspectionBuild = await Bun.build({ entrypoints: [resolve("scripts/smoke-browser-inspection.ts")],
+    target: "node", packages: "bundle", minify: true, external: ["playwright-core"],
+    outdir: scratch, naming: "browser-inspection.mjs" });
+  expect(inspectionBuild.success).toBe(true);
   // Playwright carries package-relative assets and is intentionally external.
   const { symlinkSync, realpathSync } = await import("node:fs");
   symlinkSync(realpathSync("node_modules"), join(scratch, "node_modules"), process.platform === "win32" ? "junction" : "dir");
@@ -23,6 +28,13 @@ beforeAll(async () => {
 afterAll(() => rmSync(scratch, { recursive: true, force: true }));
 
 describe("packaged Node runtime", () => {
+  test("inspects tool progress and completion when Chrome's visibility API fails", async () => {
+    const child = Bun.spawn([node!, browserSmoke], { stdout: "pipe", stderr: "pipe" });
+    const [code, stdout, stderr] = await Promise.all([child.exited,
+      new Response(child.stdout).text(), new Response(child.stderr).text()]);
+    expect({ code, stderr }).toEqual({ code: 0, stderr: "" });
+    expect(stdout).toContain("BROWSER_INSPECTION_RECOVERY_OK");
+  }, 30_000);
   test("doctor returns a structured report with a valid config even without media tools", async () => {
     const appHome = join(scratch, "state");
     mkdirSync(appHome);
