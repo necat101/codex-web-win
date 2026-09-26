@@ -16,3 +16,30 @@ diff --git a/pkg/dispatcher/internal/processor.go b/pkg/dispatcher/internal/proc
 +	if p.MCPConfig.ConnectionMaxTTL < 0 {
 +		return nil, fmt.Errorf("dispatcher processor: negative MCP connection TTL")
  	}
+@@ -328,11 +328,16 @@
+-	var cancel context.CancelFunc
+-	if provider, ok := cmd.(controlplane.ResponseDeadlineProvider); ok {
+-		if deadline, ok := provider.ResponseDeadline(); ok {
+-			ctx, cancel = p.withDeadlineCause(ctx, deadline, errResponseDeadlineExceeded)
+-			ctx = mcpclient.ContextWithResponseDeadlineEnforcement(ctx)
+-		}
+-	}
+-	if cancel == nil {
+-		ctx, cancel = context.WithCancel(ctx)
+-	}
++	var cancel context.CancelFunc
++	// Preserve the upstream response deadline for ordinary finite-TTL clients.
++	// Codex Web deliberately configures connectionMaxTTL=0 for long-horizon native
++	// tool sessions, where the active turn binding owns cancellation instead.
++	if p.connectionMaxTTL > 0 {
++		if provider, ok := cmd.(controlplane.ResponseDeadlineProvider); ok {
++			if deadline, ok := provider.ResponseDeadline(); ok {
++				ctx, cancel = p.withDeadlineCause(ctx, deadline, errResponseDeadlineExceeded)
++				ctx = mcpclient.ContextWithResponseDeadlineEnforcement(ctx)
++			}
++		}
++	}
++	if cancel == nil {
++		ctx, cancel = context.WithCancel(ctx)
++	}
+ 	defer cancel()
