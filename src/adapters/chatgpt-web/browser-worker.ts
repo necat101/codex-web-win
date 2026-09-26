@@ -23,6 +23,27 @@ import { childProcessEnvironment } from "../../process";
 
 const workers = new Map<string, ChatGptBrowserWorker>();
 
+/**
+ * ChatGPT's composer markup changes frequently. Keep the locator resilient to
+ * UI migrations by preferring stable accessibility attributes and then falling
+ * back to the editor implementations used by recent builds.
+ */
+export function chatGptComposer(page: Page): Locator {
+  return page.getByRole("textbox", { name: /Chat with ChatGPT/i }).or(
+    page.locator(
+      "#prompt-textarea, textarea[data-testid='prompt-textarea'], [data-testid='prompt-textarea'], " +
+      "[contenteditable='true'][aria-label*='Chat with ChatGPT' i], " +
+      "[contenteditable='true'][data-lexical-editor='true']",
+    ),
+  ).first();
+}
+
+export function chatGptSendButton(page: Page): Locator {
+  return page.locator(
+    "button[data-testid='send-button'], button[data-testid*='send' i], button[aria-label*='Send' i]",
+  ).first();
+}
+
 // Browser-only turns retain a bounded inactivity budget. Tool-capable turns
 // rely on explicit cancellation plus the specific DOM/operation watchdogs
 // below and must not expire merely because a generic deadline elapsed.
@@ -1576,7 +1597,7 @@ export class ChatGptBrowserWorker {
    * pill representation before comparing the composer contents with `prompt`.
    */
   private async attachedPromptText(page: Page): Promise<string> {
-    const composer = page.getByRole("textbox", { name: "Chat with ChatGPT" });
+    const composer = chatGptComposer(page);
     return composer.evaluate((element, appName) => {
       const normalizedAppName = appName.replace(/\s+/g, " ").trim();
       const connectorSelector = [
@@ -2396,7 +2417,7 @@ export class ChatGptBrowserWorker {
     );
   }
   private async attachPrompt(page: Page, prompt: string, localTools: boolean): Promise<void> {
-    const composer = page.getByRole("textbox", { name: "Chat with ChatGPT" });
+    const composer = chatGptComposer(page);
     await composer.waitFor({ state: "visible", timeout: 20_000 });
     if (!localTools) {
       await composer.fill(prompt);
@@ -2434,7 +2455,7 @@ export class ChatGptBrowserWorker {
     const input = page.locator('input[data-testid="upload-photos-input"]');
     await input.waitFor({ state: "attached", timeout: CHATGPT_ATTACHMENT_INPUT_TIMEOUT_MS });
     if (signal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
-    const send = page.getByTestId("send-button");
+    const send = chatGptSendButton(page);
     const deadline = Date.now() + CHATGPT_ATTACHMENT_UPLOAD_TIMEOUT_MS;
     const network = new ChatGptAttachmentNetworkTracker(page);
     const readiness = new ChatGptAttachmentReadinessTracker();
@@ -2603,7 +2624,7 @@ export class ChatGptBrowserWorker {
   ): Promise<ChatGptSubmissionState> {
     const userTurns = page.locator('[data-testid^="conversation-turn-"][data-turn="user"]');
     const assistantTurns = page.locator('[data-testid^="conversation-turn-"][data-turn="assistant"]');
-    const composer = page.getByRole("textbox", { name: "Chat with ChatGPT" });
+    const composer = chatGptComposer(page);
     const composerPresent = await composer.count().catch(() => 0) > 0;
     const composerHasUserText = composerPresent
       ? await this.composerHasUserText(composer)
@@ -2641,7 +2662,7 @@ export class ChatGptBrowserWorker {
     initialUserTurns: number,
     initialAssistantTurns: number,
   ): Promise<void> {
-    const composer = page.getByRole("textbox", { name: "Chat with ChatGPT" });
+    const composer = chatGptComposer(page);
     if (localTools && !await this.connectorIsSelected(page, composer)) {
       throw new Error(
         `ChatGPT connector ${JSON.stringify(this.config.appName)} was not selected immediately before submission; refusing to send a raw @mention`,
@@ -2649,7 +2670,7 @@ export class ChatGptBrowserWorker {
     }
     await this.assertPromptAttached(page, prompt);
 
-    const send = page.getByTestId("send-button");
+    const send = chatGptSendButton(page);
     const readyDeadline = Date.now() + 10_000;
     while (Date.now() < readyDeadline) {
       if (await send.isVisible().catch(() => false) && await send.isEnabled().catch(() => false)) break;
@@ -3116,7 +3137,7 @@ export class ChatGptBrowserWorker {
       await this.runStage(turn.traceId, "page_style", browserStageTimeouts.pageStyle, () => (
         this.applyLowPowerPageStyle(page)
       ), turn.abortSignal);
-      const composer = page.getByRole("textbox", { name: "Chat with ChatGPT" });
+      const composer = chatGptComposer(page);
       try {
         await this.runStage(turn.traceId, "composer_ready", browserStageTimeouts.composerReady, () => (
           composer.waitFor({ state: "visible", timeout: 30_000 })
