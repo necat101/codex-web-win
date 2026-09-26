@@ -14,6 +14,7 @@ import {
 import { dirname, join, resolve } from "node:path";
 import {
   requireTunnelClientTarget,
+  TUNNEL_CLIENT_TARGETS,
   TUNNEL_CLIENT_BUILD_ID,
   TUNNEL_CLIENT_UPSTREAM_COMMIT,
   TUNNEL_CLIENT_UPSTREAM_VERSION,
@@ -179,11 +180,31 @@ function applyNoExpiryPatch(sourceRoot: string): void {
     '\t\t\tname: "non_positive_ttl",\n\t\t\tparams: processorParams{\n\t\t\t\tLogger:          logger,\n\t\t\t\tChannelBindings: newTestChannelBindings(transport),\n\t\t\t\tTunnelResponder: responder,\n\t\t\t\tMCPConfig: func() *config.MCPConfig {\n\t\t\t\t\tcfg := *validMCP\n\t\t\t\t\tcfg.ConnectionMaxTTL = 0',
     '\t\t\tname: "negative_ttl",\n\t\t\tparams: processorParams{\n\t\t\t\tLogger:          logger,\n\t\t\t\tChannelBindings: newTestChannelBindings(transport),\n\t\t\t\tTunnelResponder: responder,\n\t\t\t\tMCPConfig: func() *config.MCPConfig {\n\t\t\t\t\tcfg := *validMCP\n\t\t\t\t\tcfg.ConnectionMaxTTL = -time.Second',
   );
+  replaceExactly(
+    processorPath,
+    '\tvar cancel context.CancelFunc\n\tif provider, ok := cmd.(controlplane.ResponseDeadlineProvider); ok {\n\t\tif deadline, ok := provider.ResponseDeadline(); ok {\n\t\t\tctx, cancel = p.withDeadlineCause(ctx, deadline, errResponseDeadlineExceeded)\n\t\t\tctx = mcpclient.ContextWithResponseDeadlineEnforcement(ctx)\n\t\t}\n\t}\n\tif cancel == nil {\n\t\tctx, cancel = context.WithCancel(ctx)\n\t}\n\tdefer cancel()',
+    '\tvar cancel context.CancelFunc\n\t// Preserve the upstream response deadline for ordinary finite-TTL clients.\n\t// Codex Web deliberately configures connectionMaxTTL=0 for long-horizon native\n\t// tool sessions, where the active turn binding owns cancellation instead.\n\tif p.connectionMaxTTL > 0 {\n\t\tif provider, ok := cmd.(controlplane.ResponseDeadlineProvider); ok {\n\t\t\tif deadline, ok := provider.ResponseDeadline(); ok {\n\t\t\t\tctx, cancel = p.withDeadlineCause(ctx, deadline, errResponseDeadlineExceeded)\n\t\t\t\tctx = mcpclient.ContextWithResponseDeadlineEnforcement(ctx)\n\t\t\t}\n\t\t}\n\t}\n\tif cancel == nil {\n\t\tctx, cancel = context.WithCancel(ctx)\n\t}\n\tdefer cancel()',
+  );
 
   const forwarder = readFileSync(processorPath, "utf8");
   if (!/connectionMaxTTL\s*>\s*0/.test(forwarder)) {
     throw new Error("Pinned tunnel-client no longer guards its MCP TTL timer with connectionMaxTTL > 0");
   }
+  if (!forwarder.includes('if p.connectionMaxTTL > 0 {\n\t\tif provider, ok := cmd.(controlplane.ResponseDeadlineProvider); ok {')) {
+    throw new Error("Pinned tunnel-client does not scope control-plane response deadlines to finite-TTL mode");
+  }
+}
+
+function buildTarget(): TunnelClientTarget {
+  const requested = process.env.CODEX_TUNNEL_CLIENT_TARGET?.trim();
+  if (!requested) return requireTunnelClientTarget();
+  const target = TUNNEL_CLIENT_TARGETS[requested as TunnelClientTargetKey];
+  if (!target) {
+    throw new Error(
+      `Unknown CODEX_TUNNEL_CLIENT_TARGET ${JSON.stringify(requested)}; expected one of ${Object.keys(TUNNEL_CLIENT_TARGETS).join(", ")}`,
+    );
+  }
+  return target;
 }
 
 function addNoExpiryRegressionTests(sourceRoot: string): void {
@@ -246,12 +267,15 @@ func TestCodexWebRejectsNegativeMCPConnectionTTL(t *testing.T) {
   writeFileSync(join(sourceRoot, "pkg", "dispatcher", "internal", "codexweb_no_expiry_test.go"), `package dispatcherinternal
 
 import (
+  "context"
+  "encoding/json"
   "io"
   "log/slog"
   "net/http"
   "testing"
   "time"
 
+  "github.com/modelcontextprotocol/go-sdk/jsonrpc"
   "github.com/stretchr/testify/require"
 )
 
@@ -274,6 +298,32 @@ func TestCodexWebNewProcessorAcceptsDisabledConnectionTTL(t *testing.T) {
   })
   require.NoError(t, err)
   require.NotNil(t, processor)
+}
+
+func TestCodexWebDisabledTTLIgnoresControlPlaneResponseDeadline(t *testing.T) {
+  t.Parallel()
+  id, err := jsonrpc.MakeID("codexweb-long-running")
+  require.NoError(t, err)
+  conn := &deadlineObservingConnection{
+    response: &jsonrpc.Response{ID: id, Result: json.RawMessage(` + "`" + `{"ok":true}` + "`" + `)},
+  }
+  transport := &deadlineObservingTransport{conn: conn}
+  responder := &deadlineObservingResponder{}
+  processor := newDeadlineTestProcessor(t, transport, responder)
+  processor.connectionMaxTTL = 0
+  command := &fakePolledCommand{
+    id:                  "codexweb-long-running-command",
+    message:             &jsonrpc.Request{ID: id, Method: "tools/call"},
+    shardToken:          "codexweb-long-running-shard",
+    responseDeadline:    time.Now().Add(-time.Second),
+    hasResponseDeadline: true,
+  }
+
+  require.NoError(t, processor.Process(context.Background(), command))
+  require.True(t, transport.deadline.IsZero(), "no-expiry mode must not put the control-plane deadline on MCP connect")
+  require.True(t, conn.writeDeadline.IsZero(), "no-expiry mode must not put the control-plane deadline on MCP writes")
+  require.True(t, conn.readDeadline.IsZero(), "no-expiry mode must not put the control-plane deadline on MCP reads")
+  require.True(t, responder.deadline.IsZero(), "no-expiry mode must not put the control-plane deadline on response posting")
 }
 `);
 }
@@ -314,7 +364,7 @@ function onlyDirectory(path: string): string {
 }
 
 export async function buildNoExpiryTunnelClient(): Promise<PatchedTunnelClientArtifact> {
-  const target = requireTunnelClientTarget();
+  const target = buildTarget();
   const toolchain = hostToolchain();
   const artifactRoot = join(cacheRoot, TUNNEL_CLIENT_BUILD_ID, target.key);
   const binaryPath = join(artifactRoot, target.binaryName);
@@ -345,7 +395,11 @@ export async function buildNoExpiryTunnelClient(): Promise<PatchedTunnelClientAr
     downloadVerified("https://api.github.com/repos/openai/tunnel-client/tarball/v0.0.12", sourceArchive, SOURCE_ARCHIVE_SHA256),
   ]);
 
-  const goRoot = join(cacheRoot, `go${GO_VERSION}.${target.key}`);
+  // Cache the compiler by the *host* toolchain, not the output target. Cross
+  // builds all reuse the same native Go executable and should not repeatedly
+  // extract identical toolchains into target-named directories.
+  const goToolchainCacheKey = toolchain.archiveName.replace(/(?:\.tar\.gz|\.zip)$/, "");
+  const goRoot = join(cacheRoot, goToolchainCacheKey);
   const goExecutable = join(goRoot, toolchain.executable);
   if (!existsSync(goExecutable)) extract(goArchive, goRoot);
   if (!existsSync(goExecutable)) throw new Error(`Pinned Go toolchain is incomplete: ${goExecutable}`);
@@ -364,40 +418,50 @@ export async function buildNoExpiryTunnelClient(): Promise<PatchedTunnelClientAr
     if (!existsSync(sourceNotice)) throw new Error("Pinned tunnel-client source archive has no NOTICE");
 
     const candidate = join(work, target.binaryName);
-    const environment = {
+    const hostEnvironment: NodeJS.ProcessEnv = {
       ...process.env,
       CGO_ENABLED: "0",
-      GOOS: target.goos,
-      GOARCH: target.goarch,
       GOTOOLCHAIN: "local",
       GOCACHE: join(cacheRoot, "go-build-cache"),
       GOMODCACHE: join(cacheRoot, "go-module-cache"),
     };
+    // Regression tests must run on the machine executing this script. Carrying
+    // GOOS/GOARCH from a requested cross-build makes Go compile a test binary
+    // the host cannot execute and wastes a large amount of time first.
+    delete hostEnvironment.GOOS;
+    delete hostEnvironment.GOARCH;
     const tests = Bun.spawnSync([
       goExecutable,
       "test",
       "./pkg/runtimeconfig",
       "./pkg/dispatcher/internal",
-    ], { cwd: sourceRoot, env: environment, stdout: "inherit", stderr: "inherit" });
+    ], { cwd: sourceRoot, env: hostEnvironment, stdout: "inherit", stderr: "inherit" });
     if (tests.exitCode !== 0) {
       throw new Error(`Patched tunnel-client regression tests failed with exit code ${tests.exitCode}`);
     }
+    const buildEnvironment: NodeJS.ProcessEnv = {
+      ...hostEnvironment,
+      GOOS: target.goos,
+      GOARCH: target.goarch,
+    };
     const build = Bun.spawnSync([
       goExecutable,
       "build",
       "-trimpath",
       "-buildvcs=false",
       "-ldflags",
-      `-X github.com/openai/tunnel-client/pkg/version.GitSHA=${TUNNEL_CLIENT_UPSTREAM_COMMIT}-codexweb-no-expiry.1`,
+      `-X github.com/openai/tunnel-client/pkg/version.GitSHA=${TUNNEL_CLIENT_UPSTREAM_COMMIT}-codexweb-no-expiry.2`,
       "-o",
       candidate,
       "./cmd/client",
-    ], { cwd: sourceRoot, env: environment, stdout: "inherit", stderr: "inherit" });
+    ], { cwd: sourceRoot, env: buildEnvironment, stdout: "inherit", stderr: "inherit" });
     if (build.exitCode !== 0 || !existsSync(candidate)) {
       throw new Error(`Patched tunnel-client build failed with exit code ${build.exitCode}`);
     }
     if (target.platform !== "win32") chmodSync(candidate, 0o755);
-    smokeNoExpiryBinary(candidate, target);
+    if (target.platform === process.platform && target.arch === process.arch) {
+      smokeNoExpiryBinary(candidate, target);
+    }
     const binaryHash = sha256(candidate);
     if (binaryHash !== target.binarySha256) {
       throw new Error(

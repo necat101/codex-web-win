@@ -102,7 +102,7 @@ if (process.platform === "win32") {
   const tunnelVersion = Bun.spawnSync([bundledTunnelClient, "--version"], { stdout: "pipe", stderr: "pipe" });
   const tunnelVersionText = `${tunnelVersion.stdout.toString()}\n${tunnelVersion.stderr.toString()}`;
   if (tunnelVersion.exitCode !== 0
-    || !tunnelVersionText.includes(`${TUNNEL_CLIENT_UPSTREAM_COMMIT}-codexweb-no-expiry.1`)) {
+    || !tunnelVersionText.includes(`${TUNNEL_CLIENT_UPSTREAM_COMMIT}-codexweb-no-expiry.2`)) {
     throw new Error(`Bundled tunnel-client has the wrong build: ${tunnelVersionText}`);
   }
   const tunnelDoctor = Bun.spawnSync([

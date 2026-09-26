@@ -280,7 +280,7 @@ try {
   assert(manifest.platform === "win32", `installed manifest platform is ${manifest.platform}`);
   assert(manifest.launcher === "bin/codex-chatgpt-web.exe", `unexpected installed launcher: ${manifest.launcher}`);
   const expectedTunnelTarget = process.arch === "arm64" ? "windows-arm64" : "windows-amd64";
-  assert(manifest.tunnelClientBuild === "0.0.12-codexweb-no-expiry.1", `unexpected installed tunnel-client build: ${manifest.tunnelClientBuild}`);
+  assert(manifest.tunnelClientBuild === "0.0.12-codexweb-no-expiry.2", `unexpected installed tunnel-client build: ${manifest.tunnelClientBuild}`);
   assert(manifest.tunnelClientTarget === expectedTunnelTarget, `unexpected installed tunnel-client target: ${manifest.tunnelClientTarget}`);
   assert(manifest.tunnelClientPath === "vendor/tunnel-client/tunnel-client.exe", `unexpected installed tunnel-client path: ${manifest.tunnelClientPath}`);
   assert(typeof manifest.tunnelClientSha256 === "string" && /^[0-9a-f]{64}$/.test(manifest.tunnelClientSha256), "installed tunnel-client hash is missing or invalid");
@@ -311,7 +311,7 @@ try {
   const installedTunnelClient = join(installedVendorDir, "tunnel-client.exe");
   const tunnelVersion = await run(installedTunnelClient, ["--version"], { env: environment, timeoutMs: 15_000 });
   assert(tunnelVersion.exitCode === 0, `installed tunnel-client --version failed: ${tunnelVersion.stderr || tunnelVersion.stdout}`);
-  assert(`${tunnelVersion.stdout}\n${tunnelVersion.stderr}`.includes("881c9a8fed7cccbe6607cd419863bbca506b8215-codexweb-no-expiry.1"), "installed tunnel-client does not report the pinned no-expiry build");
+  assert(`${tunnelVersion.stdout}\n${tunnelVersion.stderr}`.includes("881c9a8fed7cccbe6607cd419863bbca506b8215-codexweb-no-expiry.2"), "installed tunnel-client does not report the pinned no-expiry build");
   const tunnelDoctor = await run(installedTunnelClient, [
     "doctor",
     "--control-plane.tunnel-id", "tunnel_0123456789abcdef0123456789abcdef",

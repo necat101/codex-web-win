@@ -30,7 +30,7 @@ if (manifest.platform !== "win32"
   || manifest.launcher !== "bin/codex-chatgpt-web.exe"
   || manifest.gui !== "bin/codex-chatgpt-web-gui.exe"
   || manifest.uninstaller !== "bin/codex-chatgpt-web-uninstall.ps1"
-  || manifest.tunnelClientBuild !== "0.0.12-codexweb-no-expiry.1"
+  || manifest.tunnelClientBuild !== "0.0.12-codexweb-no-expiry.2"
   || manifest.tunnelClientTarget !== tunnelClientTarget
   || manifest.tunnelClientPath !== tunnelClientPath
   || typeof manifest.tunnelClientSha256 !== "string"

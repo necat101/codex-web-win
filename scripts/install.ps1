@@ -649,7 +649,7 @@ try {
       $manifest.supervisor -ne "bin/codex-chatgpt-web.exe" -or
       $manifest.gui -ne "bin/codex-chatgpt-web-gui.exe" -or
       $manifest.uninstaller -ne "bin/codex-chatgpt-web-uninstall.ps1" -or
-      $manifest.tunnelClientBuild -ne "0.0.12-codexweb-no-expiry.1" -or
+      $manifest.tunnelClientBuild -ne "0.0.12-codexweb-no-expiry.2" -or
       $manifest.tunnelClientTarget -ne $expectedTunnelTarget -or
       $manifest.tunnelClientPath -ne "vendor/tunnel-client/tunnel-client.exe" -or
       $manifest.tunnelClientSha256 -notmatch '^[0-9a-f]{64}$') {
