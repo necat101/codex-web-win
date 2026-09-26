@@ -19,6 +19,7 @@ interface ResolvedTurn {
 const bindingSchema = z.string().min(20).max(256).describe("Opaque binding_id returned by codex_bind_turn.");
 const jsonArgumentsSchema = z.record(z.string(), z.unknown()).default({});
 export const SHARED_TUNNEL_ROUTE_MISS = "CODEX_SHARED_TUNNEL_ROUTE_MISS";
+export const GATEWAY_WAIT_CELL_SESSION_PREFIX = "wait-cell:";
 const MAX_REMEMBERED_OWNED_CAPABILITIES = 16_384;
 export const MAX_GATEWAY_INVENTORY_BINDINGS = 4_096;
 export const MAX_GATEWAY_INVENTORY_CACHE_BINDINGS = 4_096;
@@ -409,9 +410,21 @@ function withYieldedSessionId<T extends { content?: unknown; structuredContent?:
     ...value,
     structuredContent: {
       ...(value.structuredContent ?? {}),
-      session_id: /^\d+$/.test(sessionId) ? Number(sessionId) : sessionId,
+      // "Script running with cell ID ..." is emitted by the outer freeform
+      // functions.exec runtime, whose continuation primitive is functions.wait.
+      // Keep that provenance in the otherwise opaque session id. Without it a
+      // harness that exposes both write_stdin and wait can feed the cell id to
+      // write_stdin, which then reports "Unknown process id" even though the
+      // outer cell is still alive.
+      session_id: `${GATEWAY_WAIT_CELL_SESSION_PREFIX}${sessionId}`,
     },
   };
+}
+
+export function waitCellSessionId(sessionId: string | number): string | undefined {
+  if (typeof sessionId !== "string" || !sessionId.startsWith(GATEWAY_WAIT_CELL_SESSION_PREFIX)) return undefined;
+  const cellId = sessionId.slice(GATEWAY_WAIT_CELL_SESSION_PREFIX.length).trim();
+  return cellId || undefined;
 }
 
 function gatewayNestedToolName(toolName: string): string {
@@ -790,7 +803,7 @@ export function createChatGptMcpServer(options: { brokerSocketPath: string }): M
     "codex_exec",
     {
       title: "Run a native Codex command",
-      description: "Invoke the command tool advertised by the current outer Codex harness. Permission is governed by the trusted bound Codex environment; dangerFullAccess pre-authorizes ordinary task-required local development commands and mutations, while real native runtime refusals/approvals remain authoritative. A long-running command returns its native session_id when the outer harness supports resumable sessions; otherwise use timeout_ms for a blocking command.",
+      description: "Invoke the command tool advertised by the current outer Codex harness. Permission is governed by the trusted bound Codex environment; dangerFullAccess pre-authorizes ordinary task-required local development commands and mutations, while real native runtime refusals/approvals remain authoritative. Omit timeout_ms for normal or long-running work: the bridge adds no hard deadline by default. Prefer a short yield_time_ms so long jobs return a resumable session_id when supported, then poll that session with codex_write_stdin. Set timeout_ms only when a real hard deadline is desired.",
       inputSchema: {
         binding_id: bindingSchema,
         cmd: z.string().min(1).max(100_000),
@@ -854,7 +867,7 @@ export function createChatGptMcpServer(options: { brokerSocketPath: string }): M
     "codex_write_stdin",
     {
       title: "Continue a native Codex command session",
-      description: "Write characters to, poll, or terminate a session_id returned by codex_exec or codex_tool_call. Harnesses exposing a wait/cell primitive support polling/termination but not stdin writes.",
+      description: "Continue a session_id returned by codex_exec or codex_tool_call. For ordinary long jobs, poll with empty chars and a reasonable yield_time_ms; write chars only for interactive stdin, or set terminate=true to stop the process. Harnesses exposing a wait/cell primitive support polling/termination but not stdin writes.",
       inputSchema: {
         binding_id: bindingSchema,
         session_id: z.union([z.number().int().nonnegative(), z.string().min(1).max(256)]),
@@ -867,30 +880,37 @@ export function createChatGptMcpServer(options: { brokerSocketPath: string }): M
     },
     async ({ binding_id, session_id, chars, yield_time_ms, max_output_tokens, terminate }, extra) => {
       const bound = await environment(binding_id, extra);
+      const requestedWaitCellId = waitCellSessionId(session_id);
       const tool = nativeFunctionTool(bound, "write_stdin");
-      const directWait = tool ? undefined : nativeFunctionTool(bound, "wait");
-      const declared = tool || directWait ? [] : gatewayNestedTools(bound);
-      const declaredContinuation = tool || directWait
-        ? undefined
-        : resolveSessionContinuationToolNameFromInventory(bound, declared);
-      const discovered = tool || directWait || declaredContinuation
-        ? declared
-        : await discoverGatewayTools(binding_id, bound, extra.signal);
-      const nestedWrite = discovered.find(candidate => candidate.wireName === "write_stdin");
-      const nestedWait = nestedWrite ? undefined : discovered.find(candidate => candidate.wireName === "wait");
+      const directWait = nativeFunctionTool(bound, "wait");
+      const declared = gatewayNestedTools(bound);
+      let nestedWrite = declared.find(candidate => candidate.wireName === "write_stdin");
+      let nestedWait = declared.find(candidate => candidate.wireName === "wait");
+      if ((!tool && !nestedWrite) || (!directWait && !nestedWait)) {
+        const discovered = await discoverGatewayTools(binding_id, bound, extra.signal);
+        nestedWrite ??= discovered.find(candidate => candidate.wireName === "write_stdin");
+        nestedWait ??= discovered.find(candidate => candidate.wireName === "wait");
+      }
+      const useWait = requestedWaitCellId !== undefined
+        ? Boolean(directWait || nestedWait)
+        : !tool && !nestedWrite && Boolean(directWait || nestedWait);
+      if (requestedWaitCellId !== undefined && !directWait && !nestedWait) {
+        throw new Error(
+          "This session_id belongs to an outer Codex wait cell, but this harness no longer exposes its wait/cell continuation capability.",
+        );
+      }
       if (!tool && !directWait && !nestedWrite && !nestedWait) {
         throw new Error(
           "This Codex harness has no resumable write_stdin or wait/cell capability. Run the command with codex_exec timeout_ms instead, and call codex_write_stdin only when codex_exec actually returned a session_id.",
         );
       }
 
-      const waitMode = Boolean(directWait || nestedWait);
-      if (waitMode && chars !== undefined && chars.length > 0) {
+      if (useWait && chars !== undefined && chars.length > 0) {
         throw new Error("This Codex harness exposes polling-only wait cells; it cannot write stdin to the yielded command");
       }
-      if (waitMode) {
+      if (useWait) {
         const waitPayload = { arguments: waitCellInvocationArgs({
-          sessionId: session_id,
+          sessionId: requestedWaitCellId ?? session_id,
           ...(yield_time_ms !== undefined ? { yieldTimeMs: yield_time_ms } : {}),
           ...(max_output_tokens !== undefined ? { maxOutputTokens: max_output_tokens } : {}),
           ...(terminate !== undefined ? { terminate } : {}),

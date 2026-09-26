@@ -1,6 +1,6 @@
 export const TUNNEL_CLIENT_UPSTREAM_VERSION = "0.0.12";
 export const TUNNEL_CLIENT_UPSTREAM_COMMIT = "881c9a8fed7cccbe6607cd419863bbca506b8215";
-export const TUNNEL_CLIENT_BUILD_ID = "0.0.12-codexweb-no-expiry.1";
+export const TUNNEL_CLIENT_BUILD_ID = "0.0.12-codexweb-no-expiry.2";
 
 export const TUNNEL_CLIENT_TARGETS = {
   "windows-amd64": {
@@ -10,7 +10,7 @@ export const TUNNEL_CLIENT_TARGETS = {
     goos: "windows",
     goarch: "amd64",
     binaryName: "tunnel-client.exe",
-    binarySha256: "cb34bc186aff6eae8525cafb7dc5b81ec1b451f6133c23b1a5e9a4284e3f0c88",
+    binarySha256: "616eb4ceb1d5cadb0ef400e68a3cc13e8488fb4d7ef867e9e31f225c9ce22840",
   },
   "windows-arm64": {
     key: "windows-arm64",

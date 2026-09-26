@@ -13,7 +13,7 @@ import {
 } from "./tunnel-client-artifact";
 import { getTunnelServiceStatus, TUNNEL_MCP_CONNECTION_MAX_TTL } from "./tunnel-service";
 
-const TUNNEL_REPORTED_BUILD_MARKER = `${TUNNEL_UPSTREAM_COMMIT}-codexweb-no-expiry.1`;
+const TUNNEL_REPORTED_BUILD_MARKER = `${TUNNEL_UPSTREAM_COMMIT}-codexweb-no-expiry.2`;
 const TUNNEL_RUNTIME_POLICY_VERSION = 2;
 
 export interface TunnelInstallManifest {

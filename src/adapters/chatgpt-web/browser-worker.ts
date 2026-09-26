@@ -47,10 +47,12 @@ export function chatGptSendButton(page: Page): Locator {
   return form.locator(CHATGPT_SEND_BUTTON_SELECTOR).filter({ visible: true }).first();
 }
 
-// Browser-only turns retain a bounded inactivity budget. Tool-capable turns
-// rely on explicit cancellation plus the specific DOM/operation watchdogs
-// below and must not expire merely because a generic deadline elapsed.
-export const DEFAULT_CHATGPT_TURN_TIMEOUT_MS = 2 * 60 * 60_000;
+// Browser-only turns retain a bounded inactivity budget, but keep a full-day
+// horizon so legitimate unattended reasoning can safely exceed 12 hours.
+// Tool-capable turns are stronger still: they rely on explicit cancellation
+// plus the specific DOM/operation watchdogs below and never expire merely
+// because a generic inactivity deadline elapsed.
+export const DEFAULT_CHATGPT_TURN_TIMEOUT_MS = 24 * 60 * 60_000;
 const MAX_CHATGPT_DELIVERY_TIMEOUT_RECOVERIES = 6;
 // ChatGPT can remount its assistant turn while a long reasoning pass is still
 // healthy. Thirty seconds proved too aggressive in production: a real 14m42s
@@ -363,6 +365,8 @@ export class ChatGptTurnDomHealthTracker {
 export interface ChatGptVisibleTraceBlock {
   kind: "markdown" | "status";
   text: string;
+  /** True only for the assistant's actual answer surface, never a thought/progress surface. */
+  finalAnswer?: boolean;
 }
 
 export interface ChatGptVisibleTraceEvent {
@@ -528,14 +532,10 @@ export class ChatGptVisibleTraceTracker {
 
   observe(
     blocks: ChatGptVisibleTraceBlock[],
-    completionActionPresent: boolean,
+    _completionActionPresent: boolean,
     now = Date.now(),
     pendingToolCount = 0,
   ): ChatGptVisibleTraceEvent[] {
-    let lastMarkdown = -1;
-    for (let index = 0; index < blocks.length; index++) {
-      if (blocks[index]!.kind === "markdown") lastMarkdown = index;
-    }
     const output: ChatGptVisibleTraceEvent[] = [];
     for (let index = 0; index < blocks.length; index++) {
       const block = blocks[index]!;
@@ -552,11 +552,13 @@ export class ChatGptVisibleTraceTracker {
         .replace(/\n{3,}/g, "\n\n")
         .trim();
       if (!text) continue;
-      // The trailing Markdown root is ambiguous while running and becomes the final answer once
-      // complete. It stays owned by ChatGptMarkdownStream; earlier roots are stable commentary.
+      // Only the explicitly identified answer surface belongs to ChatGptMarkdownStream.
+      // Current ChatGPT builds can render visible public progress/reasoning blurbs in the
+      // trailing Markdown position too, so suppressing "the last markdown node" by position
+      // withholds those blurbs until the turn finishes.
       if (pendingToolCount === 0
         && block.kind === "markdown"
-        && (completionActionPresent ? index === lastMarkdown : index === blocks.length - 1)) {
+        && block.finalAnswer === true) {
         continue;
       }
       if (block.kind === "markdown") {
@@ -3014,6 +3016,14 @@ export class ChatGptBrowserWorker {
       if (scanTraceBlocks) {
         const candidates = new Map<HTMLElement, "markdown" | "status">();
         const streamingContainers: HTMLElement[] = [];
+        const publicTraceSurfaceSelector = [
+          '[role="status"]',
+          '[data-testid*="cot" i]',
+          '[data-testid*="reason" i]',
+          '[data-testid*="thought" i]',
+          '[data-testid*="summary" i]',
+          '[data-streaming-response-status]',
+        ].join(", ");
         // Trace extraction is intentionally decoupled from the correctness poll.
         // Layout/visibility work is expensive on 2c/4t machines, while visible
         // commentary does not need sub-second freshness. Most polls now stop
@@ -3033,7 +3043,12 @@ export class ChatGptBrowserWorker {
             streamingContainers.push(candidate);
             return;
           }
-          if (candidate.matches(".markdown")) {
+          if (candidate.matches('.markdown, [data-markdown-text-style="assistant-message"]')) {
+            const publicTraceSurface = candidate.closest<HTMLElement>(publicTraceSurfaceSelector);
+            if (publicTraceSurface && publicTraceSurface !== root) {
+              if (!candidates.has(publicTraceSurface)) candidates.set(publicTraceSurface, "status");
+              return;
+            }
             candidates.set(candidate, "markdown");
             return;
           }
@@ -3059,18 +3074,20 @@ export class ChatGptBrowserWorker {
           .filter(([candidate]) => visible(candidate))
           .map(([candidate, kind]) => ({
             kind,
-            // The trailing Markdown root is the growing final answer. The trace
-            // tracker intentionally never emits it, so do not serialize its full
-            // text across the Playwright boundary on every poll. Keep an empty
-            // sentinel so tracker ordering/"last markdown" semantics stay exact.
-            text: candidate === rendered && pendingToolCount === 0 ? "" : (candidate.textContent ?? "").trim(),
-            finalAnswer: candidate === rendered,
+            // The actual answer surface can become very large. Keep it out of the
+            // live trace stream; visible public thought/progress surfaces nested in
+            // reasoning/status containers are classified as status above and are
+            // therefore still serialized immediately.
+            text: candidate === rendered && kind === "markdown" && pendingToolCount === 0
+              ? ""
+              : (candidate.textContent ?? "").trim(),
+            finalAnswer: candidate === rendered && kind === "markdown",
           }))
           .filter(block => block.finalAnswer || block.text.length > 0)
           .filter((block, index, blocks) => block.finalAnswer || (
             blocks.findIndex(other => !other.finalAnswer && other.kind === block.kind && other.text === block.text) === index
           ))
-          .map(({ kind, text }) => ({ kind, text }));
+          .map(({ kind, text, finalAnswer }) => ({ kind, text, finalAnswer }));
       }
       // Final-answer text/HTML is large and grows monotonically. It is only
       // consumed once the response action is present, so defer all three large
