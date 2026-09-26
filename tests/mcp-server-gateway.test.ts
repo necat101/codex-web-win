@@ -7,6 +7,7 @@ import {
   GatewayInventoryLastKnownGood,
   isPotentialNonOwnerBrokerError,
   execGatewayCommandProgram,
+  GATEWAY_WAIT_CELL_SESSION_PREFIX,
   execGatewayProgram,
   parseGatewayRuntimeTools,
   requestOwnershipScopeKey,
@@ -17,6 +18,7 @@ import {
   shouldReroutePotentialNonOwner,
   shellCommandInvocationArgs,
   waitCellInvocationArgs,
+  waitCellSessionId,
   yieldedSessionId,
 } from "../src/adapters/chatgpt-web/mcp-server";
 
@@ -301,6 +303,9 @@ describe("Codex exec gateway discovery", () => {
       max_tokens: 4_000,
       terminate: true,
     });
+    expect(waitCellSessionId(`${GATEWAY_WAIT_CELL_SESSION_PREFIX}66`)).toBe("66");
+    expect(waitCellSessionId(66)).toBeUndefined();
+    expect(waitCellSessionId("66")).toBeUndefined();
   });
 
   test("does not mistake ordinary command output for a yielded session", () => {

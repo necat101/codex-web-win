@@ -50,7 +50,7 @@ describe("pinned tunnel-client lifecycle", () => {
 
   test("pins the shared-stdio deadline fix", () => {
     expect(tunnelClientVersion()).toBe("0.0.12");
-    expect(tunnelClientBuildId()).toBe("0.0.12-codexweb-no-expiry.1");
+    expect(tunnelClientBuildId()).toBe("0.0.12-codexweb-no-expiry.2");
     expect(tunnelRuntimePolicyVersion()).toBe(2);
   });
 

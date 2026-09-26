@@ -11,6 +11,7 @@ import {
   CHATGPT_CONSTRAINED_PARALLELISM,
   CHATGPT_COMPLETION_OBSERVATION_GAP_MS,
   CHATGPT_DOM_PROBE_GRACE_MS,
+  DEFAULT_CHATGPT_TURN_TIMEOUT_MS,
   CHATGPT_POST_TOOL_COMPLETION_GRACE_MS,
   CHATGPT_RESPONSE_DOM_GRACE_MS,
   CHATGPT_RUNNING_WITHOUT_RESPONSE_GRACE_MS,
@@ -367,11 +368,30 @@ describe("ChatGPT browser worker memory reuse", () => {
     const events = tracker.observe([
       { kind: "markdown", text: "Finished inspecting the files." },
       { kind: "status", text: "Checking types" },
-      { kind: "markdown", text: "" },
+      { kind: "markdown", text: "", finalAnswer: true },
     ], false, 1);
 
     expect(events).toEqual([
       { kind: "commentary", text: "Finished inspecting the files." },
+    ]);
+  });
+
+  test("streams a trailing public progress blurb instead of assuming it is the final answer", () => {
+    const tracker = new ChatGptVisibleTraceTracker(0);
+    expect(tracker.observe([
+      { kind: "markdown", text: "I found the timeout path; checking the broker next." },
+    ], false, 1)).toEqual([
+      { kind: "commentary", text: "I found the timeout path; checking the broker next." },
+    ]);
+  });
+
+  test("keeps an explicitly identified final-answer surface out of live commentary", () => {
+    const tracker = new ChatGptVisibleTraceTracker(0);
+    expect(tracker.observe([
+      { kind: "status", text: "Verifying the final build" },
+      { kind: "markdown", text: "This is the finished answer", finalAnswer: true },
+    ], true, 1)).toEqual([
+      { kind: "reasoning", text: "Verifying the final build" },
     ]);
   });
 
@@ -522,6 +542,10 @@ describe("ChatGPT browser worker memory reuse", () => {
 
     expect(chatGptTurnInactivityExpired(false, deadline - 1, deadline)).toBe(false);
     expect(chatGptTurnInactivityExpired(false, deadline, deadline)).toBe(true);
+  });
+
+  test("keeps the browser-only default horizon above twelve hours", () => {
+    expect(DEFAULT_CHATGPT_TURN_TIMEOUT_MS).toBeGreaterThanOrEqual(12 * 60 * 60_000);
   });
 
   test("delivers browser heartbeats only when the worker pulses", async () => {
