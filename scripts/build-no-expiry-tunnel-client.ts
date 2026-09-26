@@ -34,6 +34,23 @@ const SOURCE_NOTICE_SHA256 = "1364c020d86ecf948b78b7c655175032068203d13aece70fb0
 const root = resolve(import.meta.dir, "..");
 const cacheRoot = join(root, "node_modules", ".cache", "codex-chatgpt-web", "tunnel-client-no-expiry");
 
+function removePath(path: string, options: Parameters<typeof rmSync>[1]): void {
+  try {
+    rmSync(path, options);
+  } catch (error) {
+    // Bun on Windows can surface EFAULT while removing long cache paths. Retry
+    // through the Windows shell primitive so packaging can recover cleanly.
+    if (process.platform === "win32" && String(error).includes("EFAULT")) {
+      const result = Bun.spawnSync(["cmd.exe", "/d", "/s", "/c", "rmdir", "/s", "/q", path], {
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      if (result.exitCode === 0 || !existsSync(path)) return;
+    }
+    throw error;
+  }
+}
+
 const GO_HOST_TOOLCHAINS = {
   "windows-amd64": {
     platform: "win32",
@@ -98,15 +115,15 @@ async function downloadVerified(url: string, destination: string, expectedHash: 
   writeFileSync(temporary, new Uint8Array(await response.arrayBuffer()));
   const actualHash = sha256(temporary);
   if (actualHash !== expectedHash) {
-    rmSync(temporary, { force: true });
+    removePath(temporary, { force: true });
     throw new Error(`SHA-256 mismatch for ${url}: expected ${expectedHash}, received ${actualHash}`);
   }
-  rmSync(destination, { force: true });
+  removePath(destination, { force: true });
   renameSync(temporary, destination);
 }
 
 function extract(archive: string, destination: string): void {
-  rmSync(destination, { recursive: true, force: true });
+  removePath(destination, { recursive: true, force: true });
   mkdirSync(destination, { recursive: true });
   const result = Bun.spawnSync([process.platform === "win32" ? "tar.exe" : "tar", "-xf", archive, "-C", destination], {
     cwd: root,
@@ -335,7 +352,7 @@ export async function buildNoExpiryTunnelClient(): Promise<PatchedTunnelClientAr
 
   const work = join(cacheRoot, `.work-${process.pid}`);
   const sourceContainer = join(work, "source");
-  rmSync(work, { recursive: true, force: true });
+  removePath(work, { recursive: true, force: true });
   try {
     extract(sourceArchive, sourceContainer);
     const sourceRoot = onlyDirectory(sourceContainer);
@@ -415,7 +432,7 @@ export async function buildNoExpiryTunnelClient(): Promise<PatchedTunnelClientAr
       sha256: binaryHash,
     };
   } finally {
-    rmSync(work, { recursive: true, force: true });
+    removePath(work, { recursive: true, force: true });
   }
 }
 
