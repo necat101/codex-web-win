@@ -17,6 +17,14 @@ import {
   chatGptReauthenticationMessage,
   CHATGPT_TEMPORARY_CHAT_URL,
   isGoogleAccountSignInUrl,
+  CHATGPT_ASSISTANT_TURN_SELECTOR,
+  CHATGPT_COMPOSER_SELECTOR,
+  CHATGPT_COMPLETION_ACTION_SELECTOR,
+  CHATGPT_EFFORT_CONTROL_SELECTOR,
+  CHATGPT_EFFORT_SLIDER_CONTAINER_SELECTOR,
+  CHATGPT_SEND_BUTTON_SELECTOR,
+  CHATGPT_STOP_BUTTON_SELECTOR,
+  CHATGPT_USER_TURN_SELECTOR,
 } from "../../chatgpt-session";
 import { loginVerificationMarkerPath } from "../../browser-login";
 import { childProcessEnvironment } from "../../process";
@@ -28,20 +36,15 @@ const workers = new Map<string, ChatGptBrowserWorker>();
  * UI migrations by preferring stable accessibility attributes and then falling
  * back to the editor implementations used by recent builds.
  */
+// CODEX_WEB_WIN_CHATGPT_UI_2026_09_25_V7
 export function chatGptComposer(page: Page): Locator {
-  return page.getByRole("textbox", { name: /Chat with ChatGPT/i }).or(
-    page.locator(
-      "#prompt-textarea, textarea[data-testid='prompt-textarea'], [data-testid='prompt-textarea'], " +
-      "[contenteditable='true'][aria-label*='Chat with ChatGPT' i], " +
-      "[contenteditable='true'][data-lexical-editor='true']",
-    ),
-  ).first();
+  return page.locator(CHATGPT_COMPOSER_SELECTOR).filter({ visible: true }).first();
 }
 
 export function chatGptSendButton(page: Page): Locator {
-  return page.locator(
-    "button[data-testid='send-button'], button[data-testid*='send' i], button[aria-label*='Send' i]",
-  ).first();
+  const composer = chatGptComposer(page);
+  const form = composer.locator("xpath=ancestor::form[1]");
+  return form.locator(CHATGPT_SEND_BUTTON_SELECTOR).filter({ visible: true }).first();
 }
 
 // Browser-only turns retain a bounded inactivity budget. Tool-capable turns
@@ -652,6 +655,7 @@ function connectorCandidateNames(element: HTMLElement): string[] {
     "img",
   ].join(", ")).forEach(icon => icon.remove());
   return [
+    element.getAttribute("app-mention-display-name") ?? "",
     element.getAttribute("aria-label") ?? "",
     element.getAttribute("title") ?? "",
     element.innerText ?? "",
@@ -761,6 +765,7 @@ export const CHATGPT_ATTACHMENT_REMOVE_CONTROL_SELECTOR = [
 ].join(", ");
 
 const CHATGPT_ATTACHMENT_CARD_SELECTOR = [
+  '.composer-attachment-surface[role="button"]',
   '[data-testid*="attachment-chip" i]',
   '[data-testid*="file-chip" i]',
   '[data-testid*="image-chip" i]',
@@ -1428,6 +1433,9 @@ export class ChatGptBrowserWorker {
 
           const composer = document.querySelector<HTMLElement>([
             "#prompt-textarea",
+            '[data-testid="prompt-textarea"]',
+            '[contenteditable="true"][data-lexical-editor="true"]',
+            'form[data-chatgpt-composer] [data-composer-markdown][contenteditable="true"][role="textbox"]',
             '[role="textbox"][aria-label="Chat with ChatGPT"]',
             '[contenteditable="true"][aria-label="Chat with ChatGPT"]',
           ].join(", "));
@@ -1544,50 +1552,130 @@ export class ChatGptBrowserWorker {
     capabilities: ChatGptWebCapabilities,
   ): Promise<ChatGptWebModelMode> {
     const mode = resolveChatGptWebModelMode(modelId, reasoning, capabilities);
-    const currentEffort = page.getByRole("button", {
-      name: /^(?:Instant(?:\s+5\.\d+)?|Medium|High|Extra High|Pro)$/,
-    }).last();
+    const composer = chatGptComposer(page);
+    const composerForm = composer.locator("xpath=ancestor::form[1]");
+    const effortIndex = ({
+      "Instant": 0,
+      "Medium": 1,
+      "High": 2,
+      "Extra High": 3,
+      "Pro": 4,
+    } as const)[mode.uiEffortLabel];
+
+    let currentEffort = composerForm.locator(CHATGPT_EFFORT_CONTROL_SELECTOR)
+      .filter({ visible: true }).last();
+
+    // Old UI fallback: the trigger itself was labelled with the selected effort.
+    if (!await currentEffort.waitFor({ state: "visible", timeout: 8_000 }).then(() => true).catch(() => false)) {
+      currentEffort = page.getByRole("button", {
+        name: /^(?:Instant(?:\s+5\.\d+)?|Medium|High|Extra High|Pro)$/,
+      }).last();
+    }
+
     try {
       await currentEffort.waitFor({ state: "visible", timeout: 70_000 });
     } catch {
       throw new Error("ChatGPT rendered the composer but its model/effort control did not become ready");
     }
-    if (chatGptEffortLabelsMatch(await currentEffort.innerText(), mode.uiEffortLabel)) return mode;
-    await currentEffort.click();
-    const effortChoiceName = mode.uiEffortLabel === "Instant"
-      ? /^Instant(?:\s+5\.\d+)?$/
-      : mode.uiEffortLabel;
-    const effortChoice = page.getByRole("menuitem", { name: effortChoiceName, exact: true }).or(
-      page.getByRole("menuitemradio", { name: effortChoiceName, exact: true }),
-    ).last();
-    try {
-      await effortChoice.waitFor({ state: "visible", timeout: 20_000 });
-    } catch {
-      const choices = (await page.locator('[role="menuitem"], [role="menuitemradio"]').allInnerTexts().catch(() => []))
-        .map(value => value.replace(/\s+/g, " ").trim())
-        .filter(value => /^(?:Instant(?: 5\.\d+)?|Medium|High|Extra High|Pro)$/.test(value));
-      throw new Error(
-        `ChatGPT effort ${JSON.stringify(mode.uiEffortLabel)} is unavailable in the authenticated account UI`
-        + (choices.length > 0 ? `; available: ${choices.join(", ")}` : ""),
-      );
-    }
-    await effortChoice.click();
-    try {
-      const deadline = Date.now() + 40_000;
-      while (Date.now() < deadline) {
-        const visibleLabel = await currentEffort.innerText().catch(() => "");
-        if (chatGptEffortLabelsMatch(visibleLabel, mode.uiEffortLabel)) return mode;
-        await new Promise(resolveSleep => setTimeout(resolveSleep, activePollingProfile.uiMs));
+
+    await currentEffort.click({ force: true, timeout: 5_000 }).catch(async () => {
+      await currentEffort.press("Enter", { timeout: 5_000 });
+    });
+
+    const sliderContainer = page.locator(CHATGPT_EFFORT_SLIDER_CONTAINER_SELECTOR)
+      .filter({ visible: true }).last();
+    const hasSlider = await sliderContainer.waitFor({ state: "visible", timeout: 5_000 })
+      .then(() => true).catch(() => false);
+
+    if (hasSlider) {
+      try {
+        const slider = sliderContainer.locator('[role="slider"]').first();
+        await slider.waitFor({ state: "attached", timeout: 5_000 });
+
+        const readState = async (): Promise<{ min: number; max: number; value: number }> => {
+          const min = Number(await slider.getAttribute("aria-valuemin"));
+          const max = Number(await slider.getAttribute("aria-valuemax"));
+          const value = Number(await slider.getAttribute("aria-valuenow"));
+          if (!Number.isInteger(min) || !Number.isInteger(max) || !Number.isInteger(value)
+            || max < min || value < min || value > max) {
+            throw new Error("ChatGPT effort slider exposed an invalid ARIA range");
+          }
+          return { min, max, value };
+        };
+
+        let state = await readState();
+        const targetValue = state.min + effortIndex;
+        if (targetValue > state.max) {
+          throw new Error(
+            `ChatGPT effort ${JSON.stringify(mode.uiEffortLabel)} is unavailable in the authenticated account UI`
+            + ` (slider range ${state.min}-${state.max})`,
+          );
+        }
+
+        const locks = await sliderContainer.evaluate(container => {
+          const power = container.hasAttribute("data-model-picker-power-slider")
+            && Boolean(container.querySelector('[data-orientation="horizontal"][aria-disabled="false"]'));
+          return Array.from(container.querySelectorAll("[data-selected]"), tick =>
+            tick.getAttribute("data-locked") ?? (power ? "false" : null));
+        }).catch(() => [] as Array<string | null>);
+        if (locks.length > effortIndex && locks[effortIndex] === "true") {
+          throw new Error(`ChatGPT effort ${JSON.stringify(mode.uiEffortLabel)} is locked for this account`);
+        }
+
+        const menuitem = slider.locator("xpath=ancestor::*[@role='menuitem'][1]");
+        const keyTarget = await menuitem.count() > 0 ? menuitem.first() : slider;
+
+        while (state.value !== targetValue) {
+          const direction = targetValue > state.value ? 1 : -1;
+          const key = direction > 0 ? "ArrowRight" : "ArrowLeft";
+          const before = state.value;
+          await keyTarget.press(key);
+
+          const deadline = Date.now() + 5_000;
+          do {
+            state = await readState();
+            if (state.value !== before) break;
+            await new Promise(resolveSleep => setTimeout(resolveSleep, 50));
+          } while (Date.now() < deadline);
+
+          if (state.value !== before + direction) {
+            throw new Error(
+              `ChatGPT effort slider did not move exactly one step with ${key}`
+              + ` (before=${before}; after=${state.value})`,
+            );
+          }
+        }
+
+        return mode;
+      } finally {
+        await page.keyboard.press("Escape").catch(() => {});
       }
-      throw new Error("effort control did not render the selected label");
-    } catch {
-      const visible = await page.getByRole("button", {
-        name: /^(?:Instant(?:\s+5\.\d+)?|Medium|High|Extra High|Pro)$/,
-      }).allInnerTexts().catch(() => []);
-      throw new Error(
-        `ChatGPT did not confirm effort ${JSON.stringify(mode.uiEffortLabel)}`
-        + (visible.length > 0 ? `; visible effort control: ${visible.at(-1)!.replace(/\s+/g, " ").trim()}` : ""),
-      );
+    }
+
+    // Previous ChatGPT UI fallback: menuitem/menuitemradio rows named by effort.
+    try {
+      if (chatGptEffortLabelsMatch(await currentEffort.innerText(), mode.uiEffortLabel)) return mode;
+      const effortChoiceName = mode.uiEffortLabel === "Instant"
+        ? /^Instant(?:\s+5\.\d+)?$/
+        : mode.uiEffortLabel;
+      const effortChoice = page.getByRole("menuitem", { name: effortChoiceName, exact: true }).or(
+        page.getByRole("menuitemradio", { name: effortChoiceName, exact: true }),
+      ).last();
+      try {
+        await effortChoice.waitFor({ state: "visible", timeout: 20_000 });
+      } catch {
+        const choices = (await page.locator('[role="menuitem"], [role="menuitemradio"]').allInnerTexts().catch(() => []))
+          .map(value => value.replace(/\s+/g, " ").trim())
+          .filter(value => /^(?:Instant(?: 5\.\d+)?|Medium|High|Extra High|Pro)$/.test(value));
+        throw new Error(
+          `ChatGPT effort ${JSON.stringify(mode.uiEffortLabel)} is unavailable in the authenticated account UI`
+          + (choices.length > 0 ? `; available: ${choices.join(", ")}` : ""),
+        );
+      }
+      await effortChoice.click();
+      return mode;
+    } finally {
+      await page.keyboard.press("Escape").catch(() => {});
     }
   }
 
@@ -1603,6 +1691,7 @@ export class ChatGptBrowserWorker {
       const connectorSelector = [
         "[data-inline-selection-pill]",
         "[data-inline-selection-pill-cursor-target]",
+        "[app-mention-path^='app://'][app-mention-display-name][contenteditable='false']",
         "[data-testid*='mention']",
         "[data-testid*='connector']",
         "[data-testid*='plugin']",
@@ -1618,6 +1707,7 @@ export class ChatGptBrowserWorker {
           "img",
         ].join(", ")).forEach(icon => icon.remove());
         return [
+          part.getAttribute("app-mention-display-name") ?? "",
           part.getAttribute("aria-label") ?? "",
           part.getAttribute("title") ?? "",
           part.innerText ?? "",
@@ -1657,6 +1747,7 @@ export class ChatGptBrowserWorker {
       const connectorSelector = [
         "[data-inline-selection-pill]",
         "[data-inline-selection-pill-cursor-target]",
+        "[app-mention-path^='app://'][app-mention-display-name][contenteditable='false']",
         "[data-testid*='mention']",
         "[data-testid*='connector']",
         "[data-testid*='plugin']",
@@ -1666,6 +1757,7 @@ export class ChatGptBrowserWorker {
       const isConnectorPart = (part: HTMLElement): boolean => {
         if (!part.matches(connectorSelector)) return false;
         return [
+          part.getAttribute("app-mention-display-name") ?? "",
           part.getAttribute("aria-label") ?? "",
           part.getAttribute("title") ?? "",
           part.innerText ?? "",
@@ -1745,6 +1837,7 @@ export class ChatGptBrowserWorker {
           "img",
         ].join(", ")).forEach(icon => icon.remove());
         return [
+          part.getAttribute("app-mention-display-name") ?? "",
           part.getAttribute("aria-label") ?? "",
           part.getAttribute("title") ?? "",
           part.innerText ?? "",
@@ -1761,6 +1854,7 @@ export class ChatGptBrowserWorker {
       const composerCandidateSelector = [
         "[data-inline-selection-pill]",
         "[data-inline-selection-pill-cursor-target]",
+        "[app-mention-path^='app://'][app-mention-display-name][contenteditable='false']",
         "[data-testid*='mention']",
         "[data-testid*='connector']",
         "[data-testid*='plugin']",
@@ -1772,14 +1866,14 @@ export class ChatGptBrowserWorker {
       const candidates = new Set<HTMLElement>([
         ...composerHtml.querySelectorAll<HTMLElement>(composerCandidateSelector),
         ...document.querySelectorAll<HTMLElement>(
-          "[data-inline-selection-pill], [data-inline-selection-pill-cursor-target]",
+          "[data-inline-selection-pill], [data-inline-selection-pill-cursor-target], [app-mention-path^='app://'][app-mention-display-name][contenteditable='false']",
         ),
       ]);
       for (const candidate of candidates) {
         if (!visibleElement(candidate)) continue;
         const rect = candidate.getBoundingClientRect();
         const testId = candidate.getAttribute("data-testid")?.toLowerCase() ?? "";
-        const knownPill = candidate.matches("[data-inline-selection-pill], [data-inline-selection-pill-cursor-target]")
+        const knownPill = candidate.matches("[data-inline-selection-pill], [data-inline-selection-pill-cursor-target], [app-mention-path^='app://'][app-mention-display-name][contenteditable='false']")
           || testId.includes("mention")
           || testId.includes("connector")
           || testId.includes("plugin");
@@ -1831,6 +1925,7 @@ export class ChatGptBrowserWorker {
           "a",
           "[data-inline-selection-pill]",
           "[data-inline-selection-pill-cursor-target]",
+          "[app-mention-path^='app://'][app-mention-display-name][contenteditable='false']",
           "[data-testid*='plugin']",
           "[data-testid*='connector']",
           "[contenteditable='false']",
@@ -1876,7 +1971,7 @@ export class ChatGptBrowserWorker {
    */
   private async visibleConnectorSuggestion(page: Page): Promise<Locator | undefined> {
     const candidates: Array<{ locator: Locator; accessibleNameMatched: boolean }> = [
-      { locator: page.getByRole("option", { name: this.config.appName, exact: true }), accessibleNameMatched: true },
+      { locator: page.locator('[data-mention-list-scroll-area] button[data-list-navigation-item="true"]').filter({ hasText: this.config.appName }), accessibleNameMatched: false },      { locator: page.getByRole("option", { name: this.config.appName, exact: true }), accessibleNameMatched: true },
       { locator: page.getByRole("menuitem", { name: this.config.appName, exact: true }), accessibleNameMatched: true },
       { locator: page.getByRole("button", { name: this.config.appName, exact: true }), accessibleNameMatched: true },
       { locator: page.getByRole("link", { name: this.config.appName, exact: true }), accessibleNameMatched: true },
@@ -1913,6 +2008,9 @@ export class ChatGptBrowserWorker {
           const scope = (["group", "listitem"].includes(ownRole) ? html : row) ?? html;
           const composer = document.querySelector<HTMLElement>([
             "#prompt-textarea",
+            '[data-testid="prompt-textarea"]',
+            '[contenteditable="true"][data-lexical-editor="true"]',
+            'form[data-chatgpt-composer] [data-composer-markdown][contenteditable="true"][role="textbox"]',
             '[role="textbox"][aria-label="Chat with ChatGPT"]',
             '[contenteditable="true"][aria-label="Chat with ChatGPT"]',
           ].join(", "));
@@ -2070,6 +2168,9 @@ export class ChatGptBrowserWorker {
           };
           const composer = document.querySelector<HTMLElement>([
             "#prompt-textarea",
+            '[data-testid="prompt-textarea"]',
+            '[contenteditable="true"][data-lexical-editor="true"]',
+            'form[data-chatgpt-composer] [data-composer-markdown][contenteditable="true"][role="textbox"]',
             '[role="textbox"][aria-label="Chat with ChatGPT"]',
             '[contenteditable="true"][aria-label="Chat with ChatGPT"]',
           ].join(", "));
@@ -2160,6 +2261,9 @@ export class ChatGptBrowserWorker {
       const nearComposer = await pluginsButton.evaluate(button => {
         const composer = document.querySelector<HTMLElement>([
           "#prompt-textarea",
+          '[data-testid="prompt-textarea"]',
+          '[contenteditable="true"][data-lexical-editor="true"]',
+          'form[data-chatgpt-composer] [data-composer-markdown][contenteditable="true"][role="textbox"]',
           '[role="textbox"][aria-label="Chat with ChatGPT"]',
           '[contenteditable="true"][aria-label="Chat with ChatGPT"]',
         ].join(", "));
@@ -2213,7 +2317,7 @@ export class ChatGptBrowserWorker {
    */
   private async visibleMentionConnectorPopupTarget(page: Page, composer: Locator): Promise<Locator | undefined> {
     const candidates: Locator[] = [
-      page.getByRole("option", { name: this.config.appName, exact: true }),
+      page.locator('[data-mention-list-scroll-area] button[data-list-navigation-item="true"]').filter({ hasText: this.config.appName }),      page.getByRole("option", { name: this.config.appName, exact: true }),
       page.getByRole("menuitem", { name: this.config.appName, exact: true }),
       page.getByRole("menuitemradio", { name: this.config.appName, exact: true }),
       page.getByRole("button", { name: this.config.appName, exact: true }),
@@ -2243,6 +2347,9 @@ export class ChatGptBrowserWorker {
           };
           const composerElement = document.querySelector<HTMLElement>([
             "#prompt-textarea",
+            '[data-testid="prompt-textarea"]',
+            '[contenteditable="true"][data-lexical-editor="true"]',
+            'form[data-chatgpt-composer] [data-composer-markdown][contenteditable="true"][role="textbox"]',
             '[role="textbox"][aria-label="Chat with ChatGPT"]',
             '[contenteditable="true"][aria-label="Chat with ChatGPT"]',
           ].join(", "));
@@ -2452,7 +2559,7 @@ export class ChatGptBrowserWorker {
     if (signal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
     const removeControls = page.locator(CHATGPT_ATTACHMENT_REMOVE_CONTROL_SELECTOR);
     const existing = await removeControls.count();
-    const input = page.locator('input[data-testid="upload-photos-input"]');
+    const input = page.locator('input[data-testid="upload-photos-input"], form[data-chatgpt-composer] input[type="file"][multiple]:not([accept])').first();
     await input.waitFor({ state: "attached", timeout: CHATGPT_ATTACHMENT_INPUT_TIMEOUT_MS });
     if (signal?.aborted) throw new DOMException("ChatGPT web turn aborted", "AbortError");
     const send = chatGptSendButton(page);
@@ -2611,9 +2718,9 @@ export class ChatGptBrowserWorker {
   }
 
   private stopControl(page: Page): Locator {
-    return page.getByRole("button", { name: /^Stop (?:answering|generating)$/i }).or(
-      page.getByTestId("stop-button"),
-    ).or(page.getByRole("button", { name: "Answer now", exact: true })).last();
+    return page.locator(CHATGPT_STOP_BUTTON_SELECTOR).filter({ visible: true }).or(
+      page.getByRole("button", { name: "Answer now", exact: true }),
+    ).last();
   }
 
   private async submissionState(
@@ -2622,8 +2729,8 @@ export class ChatGptBrowserWorker {
     initialUserTurns: number,
     initialAssistantTurns: number,
   ): Promise<ChatGptSubmissionState> {
-    const userTurns = page.locator('[data-testid^="conversation-turn-"][data-turn="user"]');
-    const assistantTurns = page.locator('[data-testid^="conversation-turn-"][data-turn="assistant"]');
+    const userTurns = page.locator(CHATGPT_USER_TURN_SELECTOR);
+    const assistantTurns = page.locator(CHATGPT_ASSISTANT_TURN_SELECTOR);
     const composer = chatGptComposer(page);
     const composerPresent = await composer.count().catch(() => 0) > 0;
     const composerHasUserText = composerPresent
@@ -2822,7 +2929,7 @@ export class ChatGptBrowserWorker {
     pendingToolCount = 0,
     basicProbe = false,
   ): Promise<ChatGptResponseDomSnapshot> {
-    const snapshot = await page.evaluate(({ maxTraceCandidates, responseIndex, scanRecoverySignals, scanTraceBlocks, pendingToolCount, basicProbe }) => {
+    const snapshot = await page.evaluate(({ maxTraceCandidates, responseIndex, scanRecoverySignals, scanTraceBlocks, pendingToolCount, basicProbe, assistantTurnSelector, stopButtonSelector, completionActionSelector }) => {
       const visible = (candidate: HTMLElement): boolean => {
         if (!basicProbe && typeof candidate.checkVisibility === "function") {
           try {
@@ -2844,11 +2951,7 @@ export class ChatGptBrowserWorker {
           && rect.width > 0
           && rect.height > 0;
       };
-      const stopControls = document.querySelectorAll<HTMLElement>([
-        'button[data-testid="stop-button"]',
-        'button[aria-label="Stop answering"]',
-        'button[aria-label="Stop generating"]',
-      ].join(", "));
+      const stopControls = document.querySelectorAll<HTMLElement>(stopButtonSelector);
       // Responsive layouts can leave a hidden stale Stop button before the
       // visible current one. Inspect every match, and recognize ChatGPT's
       // long-reasoning "Answer now" control as equivalent liveness evidence.
@@ -2878,9 +2981,7 @@ export class ChatGptBrowserWorker {
         }
       }
 
-      const root = document.querySelectorAll<HTMLElement>(
-        '[data-testid^="conversation-turn-"][data-turn="assistant"]',
-      )[responseIndex];
+      const root = document.querySelectorAll<HTMLElement>(assistantTurnSelector)[responseIndex];
       if (!root) {
         return {
           responsePresent: false,
@@ -2903,15 +3004,12 @@ export class ChatGptBrowserWorker {
       }
 
       let rendered: HTMLElement | undefined;
-      for (const candidate of root.querySelectorAll<HTMLElement>(".markdown")) rendered = candidate;
+      for (const candidate of root.querySelectorAll<HTMLElement>('.markdown, [data-markdown-text-style="assistant-message"]')) rendered = candidate;
       // ChatGPT may keep the response-actions row hidden until hover or move it
       // behind responsive UI on smaller displays. DOM presence is the stable
       // completion signal; requiring the Copy button to be visibly laid out can
       // deadlock a finished turn on slower/smaller machines.
-      const completionActionPresent = root.querySelector<HTMLElement>([
-        'button[aria-label="Copy response"]',
-        'button[data-testid="copy-turn-action-button"]',
-      ].join(', ')) !== null;
+      const completionActionPresent = root.querySelector<HTMLElement>(completionActionSelector) !== null;
       let traceBlocks: ChatGptVisibleTraceBlock[] = [];
       if (scanTraceBlocks) {
         const candidates = new Map<HTMLElement, "markdown" | "status">();
@@ -2922,6 +3020,7 @@ export class ChatGptBrowserWorker {
         // after reading the tiny completion state above.
         root.querySelectorAll<HTMLElement>([
           ".markdown",
+          '[data-markdown-text-style="assistant-message"]',
           "button",
           '[role="status"]',
           '[aria-busy="true"]',
@@ -3000,6 +3099,9 @@ export class ChatGptBrowserWorker {
       scanTraceBlocks,
       pendingToolCount,
       basicProbe,
+      assistantTurnSelector: CHATGPT_ASSISTANT_TURN_SELECTOR,
+      stopButtonSelector: CHATGPT_STOP_BUTTON_SELECTOR,
+      completionActionSelector: CHATGPT_COMPLETION_ACTION_SELECTOR,
     }).then(value => ({ ...value, probeSucceeded: true } satisfies ChatGptResponseDomSnapshot))
       .catch(async error => {
         const message = error instanceof Error ? error.message : String(error);
@@ -3028,14 +3130,17 @@ export class ChatGptBrowserWorker {
   }
 
   private async finalResponseHtml(page: Page, responseIndex: number): Promise<string | undefined> {
-    return page.evaluate(responseIndex => {
-      const root = document.querySelectorAll<HTMLElement>(
-        '[data-testid^="conversation-turn-"][data-turn="assistant"]',
-      )[responseIndex];
+    return page.evaluate(({ responseIndex, assistantTurnSelector }) => {
+      const root = document.querySelectorAll<HTMLElement>(assistantTurnSelector)[responseIndex];
       if (!root) return undefined;
-      const markdown = root.querySelectorAll<HTMLElement>(".markdown");
+      const markdown = root.querySelectorAll<HTMLElement>(
+        '.markdown, [data-markdown-text-style="assistant-message"]',
+      );
       return markdown.length > 0 ? markdown[markdown.length - 1]!.innerHTML : "";
-    }, responseIndex).catch(() => undefined);
+    }, {
+      responseIndex,
+      assistantTurnSelector: CHATGPT_ASSISTANT_TURN_SELECTOR,
+    }).catch(() => undefined);
   }
 
   private async stalledTurnDiagnostic(page: Page, responseTurn: Locator): Promise<string> {
@@ -3184,8 +3289,8 @@ export class ChatGptBrowserWorker {
       await this.runStage(turn.traceId, "file_attachment", browserStageTimeouts.fileAttachment, () => (
         this.attachFiles(page, prepared, turn.abortSignal)
       ), turn.abortSignal);
-      const userTurns = page.locator('[data-testid^="conversation-turn-"][data-turn="user"]');
-      const responseTurns = page.locator('[data-testid^="conversation-turn-"][data-turn="assistant"]');
+      const userTurns = page.locator(CHATGPT_USER_TURN_SELECTOR);
+      const responseTurns = page.locator(CHATGPT_ASSISTANT_TURN_SELECTOR);
       eventStream = new ChatGptBrowserEventStream(delta => {
         if (turn.abortSignal?.aborted) return;
         if (delta.kind === "final") {

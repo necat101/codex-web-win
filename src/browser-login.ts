@@ -8,6 +8,7 @@ import { childProcessEnvironment } from "./process";
 import {
   assertAuthenticatedChatGptPage,
   assertTemporaryChatPage,
+  CHATGPT_COMPOSER_SELECTOR,
   CHATGPT_TEMPORARY_CHAT_URL,
   detectChatGptProCapability,
   GOOGLE_SECURE_BROWSER_RELOGIN_MESSAGE,
@@ -82,7 +83,7 @@ async function inspectStoredState(
       if (isGoogleAccountSignInUrl(verifierPage.url())) {
         throw new Error(GOOGLE_SECURE_BROWSER_RELOGIN_MESSAGE);
       }
-      await verifierPage.getByRole("textbox", { name: "Chat with ChatGPT" }).waitFor({ state: "visible", timeout: 60_000 });
+      await verifierPage.locator(CHATGPT_COMPOSER_SELECTOR).filter({ visible: true }).first().waitFor({ state: "visible", timeout: 60_000 });
       await assertAuthenticatedChatGptPage(verifierPage);
       await assertTemporaryChatPage(verifierPage);
       return { proAvailable: await detectChatGptProCapability(verifierPage), url: verifierPage.url() };
@@ -282,10 +283,8 @@ export async function loginToChatGpt(
     if (isGoogleAccountSignInUrl(page.url())) {
       throw new Error(GOOGLE_SECURE_BROWSER_RELOGIN_MESSAGE);
     }
-    const composer = page.getByRole("textbox", { name: "Chat with ChatGPT" }).or(
-      page.locator('[data-testid="prompt-textarea"], [contenteditable="true"][data-lexical-editor="true"]'),
-    ).first();
-    try {
+    // CODEX_WEB_WIN_CHATGPT_UI_2026_09_25_V7
+    const composer = page.locator(CHATGPT_COMPOSER_SELECTOR).filter({ visible: true }).first();    try {
       await composer.waitFor({ state: "visible", timeout: options.timeoutMs ?? 60_000 });
     } catch {
       throw new Error(
