@@ -206,7 +206,13 @@ export function chatGptTurnExecutionKey(parsed: CodexParsedRequest): string {
         requestHash: createHash("sha256").update(JSON.stringify(parsed._rawBody ?? {})).digest("hex"),
       }
     : {
-        threadId: identity.threadId,
+        // `turn_id` is the stable native execution identity. Codex can rotate
+        // `thread_id` while preserving one in-flight turn (notably when a
+        // context-compaction boundary opens a fresh browser/conversation
+        // surface). Hashing that transport-local thread id here split one
+        // logical turn into unrelated browser sessions and stranded the old
+        // runtime/tool binding. Keep the compaction epoch as the only intended
+        // execution-key boundary inside a native turn.
         turnId: identity.turnId,
         contextCompactionEpoch: parsed._contextCompactionEpoch ?? null,
       };
@@ -237,7 +243,9 @@ export function chatGptTurnExecutionFamilyKey(parsed: CodexParsedRequest): strin
         requestHash: createHash("sha256").update(JSON.stringify(parsed._rawBody ?? {})).digest("hex"),
       }
     : {
-        threadId: identity.threadId,
+        // A family spans every browser epoch of the same native turn. Native
+        // `thread_id` is intentionally excluded because it may rotate at the
+        // exact compaction/window handoff this family key is meant to bridge.
         turnId: identity.turnId,
       };
   return createHash("sha256").update(JSON.stringify({

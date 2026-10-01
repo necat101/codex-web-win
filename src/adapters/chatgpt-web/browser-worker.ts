@@ -6,6 +6,13 @@ import { atomicWriteFile, defaultChromeExecutable, expandUserPath, getConfigDir 
 import type { CodexProviderConfig } from "../../types";
 import { browserComposerTextMatches, normalizeBrowserComposerText } from "../composer-text";
 import { parseDataUrl } from "../image";
+import { AdapterTurnError } from "../base";
+import { CLOUDFLARE_CHALLENGE_CODE } from "../../cloudflare-challenge";
+import {
+  applyAutomationSignalSuppression,
+  automationSuppressionIgnoredArgs,
+  automationSuppressionLaunchArgs,
+} from "../../browser-automation-signals";
 import { ChatGptMarkdownStream } from "./markdown";
 import { ChatGptBrowserEventStream, ChatGptStreamDiagnostics } from "./event-stream";
 import { resolveChatGptWebModelMode, type ChatGptWebCapabilities, type ChatGptWebModelMode } from "./model";
@@ -25,6 +32,10 @@ import {
   CHATGPT_SEND_BUTTON_SELECTOR,
   CHATGPT_STOP_BUTTON_SELECTOR,
   CHATGPT_USER_TURN_SELECTOR,
+  assertNoChatGptCloudflareChallenge,
+  chatGptCloudflareChallengeMessage,
+  chatGptCloudflareChallengeSignal,
+  waitForCloudflareChallengeToClear,
 } from "../../chatgpt-session";
 import { loginVerificationMarkerPath } from "../../browser-login";
 import { childProcessEnvironment } from "../../process";
@@ -67,6 +78,9 @@ export const CHATGPT_COMPLETION_OBSERVATION_GAP_MS = 10_000;
 export const CHATGPT_WATCHDOG_OBSERVATION_GAP_MS = 30_000;
 export const CHATGPT_MAX_SCHEDULER_GAP_EXTENSION_MS = 60 * 60_000;
 export const CHATGPT_RESPONSE_POLL_MS = 1_250;
+// Managed challenges normally clear within seconds; an interactive one never
+// clears without the user, so bound the wait instead of looping forever.
+export const CHATGPT_CLOUDFLARE_CLEAR_MS = 20_000;
 export const CHATGPT_TOOL_WAIT_POLL_MS = 15_000;
 export const CHATGPT_UI_POLL_MS = 500;
 export const CHATGPT_TRACE_POLL_MS = 4_000;
@@ -1035,8 +1049,8 @@ class ChatGptSharedBrowser {
       executablePath: this.config.chromeExecutablePath,
       headless: !this.config.headed,
       env: childProcessEnvironment(),
-      ignoreDefaultArgs: [...CHATGPT_IGNORED_DEFAULT_ARGS],
-      args: [...CHATGPT_LOW_RESOURCE_LAUNCH_ARGS],
+      ignoreDefaultArgs: [...CHATGPT_IGNORED_DEFAULT_ARGS, ...automationSuppressionIgnoredArgs()],
+      args: [...CHATGPT_LOW_RESOURCE_LAUNCH_ARGS, ...automationSuppressionLaunchArgs()],
     });
     this.launchPromise = launch;
     try {
@@ -1210,13 +1224,19 @@ export class ChatGptBrowserWorker {
         this.discardContext();
       }
     }
-    const createContext = (browser: Browser) => browser.newContext({
-      storageState: this.config.storageStatePath,
-      // ChatGPT has several continuously animated surfaces while reasoning and
-      // invoking tools. Prefer the platform's reduced-motion path so Chromium
-      // spends less main-thread/GPU time animating UI the bridge never needs.
-      reducedMotion: "reduce",
-    });
+    const createContext = async (browser: Browser) => {
+      const context = await browser.newContext({
+        storageState: this.config.storageStatePath,
+        // ChatGPT has several continuously animated surfaces while reasoning and
+        // invoking tools. Prefer the platform's reduced-motion path so Chromium
+        // spends less main-thread/GPU time animating UI the bridge never needs.
+        reducedMotion: "reduce",
+      });
+      // Cloudflare loops its challenge on a browser that advertises automation;
+      // suppress that signal. This never solves or bypasses the challenge.
+      await applyAutomationSignalSuppression(context);
+      return context;
+    };
     let browser = await this.sharedBrowser.get();
     try {
       this.context = await createContext(browser);
@@ -3259,6 +3279,9 @@ export class ChatGptBrowserWorker {
       await this.runStage(turn.traceId, "page_style", browserStageTimeouts.pageStyle, () => (
         this.applyLowPowerPageStyle(page)
       ), turn.abortSignal);
+      await this.runStage(turn.traceId, "cloudflare_challenge", browserStageTimeouts.composerReady, () => (
+        assertNoChatGptCloudflareChallenge(page, CHATGPT_CLOUDFLARE_CLEAR_MS)
+      ), turn.abortSignal);
       const composer = chatGptComposer(page);
       try {
         await this.runStage(turn.traceId, "composer_ready", browserStageTimeouts.composerReady, () => (
@@ -3266,6 +3289,8 @@ export class ChatGptBrowserWorker {
         ), turn.abortSignal);
       } catch (error) {
         if (error instanceof DOMException && error.name === "AbortError") throw error;
+        const challenge = await chatGptCloudflareChallengeSignal(page);
+        if (challenge) throw new Error(chatGptCloudflareChallengeMessage(challenge));
         const loginButtonVisible = await page.getByRole("button", { name: "Log in", exact: true })
           .isVisible()
           .catch(() => false);
@@ -3475,6 +3500,26 @@ export class ChatGptBrowserWorker {
           scanRecoverySignals,
           scanTraceBlocks,
         );
+        // A Cloudflare interstitial replaces the whole document, so the turn
+        // would otherwise sit here until the generic inactivity deadline. Wait
+        // briefly for a managed challenge to clear, then fail closed with the
+        // real cause instead of looping Codex's reconnect budget.
+        if (scanRecoverySignals) {
+          const challenge = await chatGptCloudflareChallengeSignal(page);
+          if (challenge) {
+            const lingering = await waitForCloudflareChallengeToClear(page, CHATGPT_CLOUDFLARE_CLEAR_MS);
+            if (lingering) {
+              throw new AdapterTurnError(chatGptCloudflareChallengeMessage(lingering), {
+                status: 503,
+                errorType: "server_error",
+                code: CLOUDFLARE_CHALLENGE_CODE,
+                retryable: false,
+              });
+            }
+            recordActivity();
+            continue;
+          }
+        }
         if (mode.localTools
           && snapshot.deliveryTimeoutPresent
           && await this.recoverMessageDeliveryTimeout(page, deliveryTimeoutRecoveries)) {

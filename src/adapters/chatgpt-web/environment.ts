@@ -112,6 +112,23 @@ function isNativeSkillPromptItem(value: unknown): boolean {
   });
 }
 
+/**
+ * Current Codex Desktop stamps world-state fragments with an explicit native
+ * content kind. That kind is assigned by Codex itself and can never be produced
+ * by user-authored message text, so it proves the item is Codex's own
+ * environment context even when the fragment is not adjacent to the active user
+ * item. Codex injects extra contextual user items (for example the app page
+ * state) between the environment context and the real prompt, which previously
+ * pushed the pair out of the trusted positional window and made the resolver
+ * fail closed with "missing environment context".
+ */
+function isExplicitEnvironmentContextItem(value: unknown): boolean {
+  const item = record(value);
+  if (item?.type !== "message" || item.role !== "user") return false;
+  const kinds = record(item.internal_chat_message_metadata_passthrough)?.content_item_kinds;
+  return Array.isArray(kinds) && kinds.some(kind => kind === "environments.environment_context");
+}
+
 function environmentTextPart(value: unknown): string | undefined {
   const item = record(value);
   if (item?.type !== "message" || item.role !== "user") return undefined;
@@ -171,6 +188,12 @@ function trustedEnvironmentTexts(parsed: CodexParsedRequest): TrustedEnvironment
     // items. Distinct native Responses item ids still prove this is Codex's
     // adjacent context/user pair; user-authored XML remains inside one item.
     const itemProvenance = Boolean(candidateId && userId && candidateId !== userId);
+    // A Codex-assigned content kind is provenance on its own: unlike the XML
+    // text it cannot be forged inside a user message, so a kind-tagged fragment
+    // with a server-owned item id stays trusted even when the turn metadata
+    // omits turn_id or a contextual user item separates it from the prompt.
+    const explicitEnvironmentItem = isExplicitEnvironmentContextItem(input[candidateIndex]);
+    const declaredEnvironmentProvenance = Boolean(explicitEnvironmentItem && candidateId);
     const exactCurrentTurn = Boolean(
       currentMetadataTurnId && turnProvenance && candidateTurnId === currentMetadataTurnId,
     );
@@ -184,7 +207,8 @@ function trustedEnvironmentTexts(parsed: CodexParsedRequest): TrustedEnvironment
     const currentPair = userIndex === activeUserIndex;
     const replayedCompletedPair = userIndex < activeUserIndex
       && hasAssistantOutputBetween(input, userIndex + 1, activeUserIndex);
-    if ((metadataCurrentPair || currentPair || replayedCompletedPair) && (turnProvenance || itemProvenance)) {
+    if ((metadataCurrentPair || currentPair || replayedCompletedPair || explicitEnvironmentItem)
+      && (turnProvenance || itemProvenance || declaredEnvironmentProvenance)) {
       trusted.push({ text, currentTurn: metadataCurrentPair || currentPair });
     }
   }

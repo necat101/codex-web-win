@@ -674,11 +674,28 @@ async function writeWebResponse(
     outgoing.end();
     return;
   }
+  // SSE frames are small and latency-sensitive: disable Nagle so each event is
+  // flushed as its own segment instead of being coalesced behind the socket.
+  outgoing.socket?.setNoDelay(true);
   outgoing.flushHeaders();
-  await pipeline(
-    Readable.fromWeb(response.body as unknown as import("node:stream/web").ReadableStream),
-    outgoing,
-  );
+  try {
+    await pipeline(
+      Readable.fromWeb(response.body as unknown as import("node:stream/web").ReadableStream),
+      outgoing,
+    );
+  } catch (error) {
+    // A truncated chunked stream is exactly what makes Codex report "stream
+    // disconnected ... error decoding response body". When the connection is
+    // still writable, finish the response cleanly (proper chunked terminator)
+    // so the client observes EOF instead of a reset and can honor the in-band
+    // terminal error event the bridge already emitted.
+    if (!outgoing.destroyed && outgoing.writable) {
+      outgoing.end();
+      return;
+    }
+    if (outgoing.destroyed || outgoing.writableEnded) return;
+    throw error;
+  }
 }
 
 export async function startServer(
@@ -774,6 +791,10 @@ export async function startServer(
           outgoing.statusCode = 500;
           outgoing.setHeader("content-type", "application/json");
           outgoing.end(JSON.stringify({ error: { type: "server_error", message } }));
+        } else if (outgoing.writable) {
+          // Prefer a clean EOF over an RST once headers are committed; an abrupt
+          // destroy mid-chunk is what surfaces downstream as a body-decode error.
+          outgoing.end();
         } else {
           outgoing.destroy(error instanceof Error ? error : new Error(message));
         }

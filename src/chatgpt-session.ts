@@ -1,4 +1,5 @@
 import type { Locator, Page } from "playwright-core";
+import { CLOUDFLARE_CHALLENGE_MESSAGE, cloudflareChallengeSignal } from "./cloudflare-challenge";
 
 // CODEX_WEB_WIN_CHATGPT_UI_2026_09_25_V7
 // Compatibility selectors mirrored from the current ChatGPT web layout while
@@ -70,6 +71,99 @@ export function chatGptReauthenticationMessage(currentUrl: string): string {
   return "ChatGPT web login is expired. Run `codex-chatgpt-web login` to refresh it in a normal Chrome window.";
 }
 
+/**
+ * Detect a Cloudflare/edge challenge interstitial in the page. The probe is
+ * intentionally self-contained so Playwright can serialize it into the page.
+ * Returns a short signal label (for diagnostics) or undefined when the page is
+ * free of challenge markers. It never solves or bypasses the challenge.
+ */
+export async function chatGptCloudflareChallengeSignal(page: Page): Promise<string | undefined> {
+  return page.evaluate(() => {
+    const patterns: Array<{ label: string; pattern: RegExp }> = [
+      { label: "cloudflare_challenge", pattern: /cloudflare[\s_-]?challenge/i },
+      { label: "cf-mitigated: challenge", pattern: /cf-mitigated[\s"':]*challenge/i },
+      { label: "Enable JavaScript and cookies", pattern: /enable javascript and cookies to continue/i },
+      { label: "Just a moment", pattern: /\bjust a moment\b/i },
+      { label: "Checking your browser", pattern: /checking (?:your browser|if the site connection is secure)/i },
+      { label: "Verify you are human", pattern: /verify (?:you are|that you are) (?:a )?human/i },
+      { label: "Unusual traffic", pattern: /unusual traffic/i },
+      { label: "Captcha challenge", pattern: /\bcaptcha[\s-]*challenge\b/i },
+    ];
+    const visible = (element: Element): boolean => {
+      const candidate = element as HTMLElement;
+      if (typeof candidate.checkVisibility === "function") {
+        return candidate.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true, contentVisibilityAuto: true });
+      }
+      const style = getComputedStyle(candidate);
+      const rect = candidate.getBoundingClientRect();
+      return style.display !== "none" && style.visibility !== "hidden" && rect.width > 0 && rect.height > 0;
+    };
+
+    const surface = `${document.title ?? ""}\n${document.body?.innerText ?? ""}`;
+    for (const { label, pattern } of patterns) {
+      if (pattern.test(surface)) return label;
+    }
+
+    // Cloudflare's full-page interstitial exposes these specific nodes. Do NOT
+    // treat Cloudflare's always-injected `challenge-platform` script, Turnstile
+    // iframes, or generic "challenge" attributes as signals: they are present on
+    // entirely healthy ChatGPT pages and previously produced false positives
+    // that aborted setup before the user could do anything.
+    const interstitial = document.querySelector<HTMLElement>(
+      '#challenge-form, #challenge-stage, #challenge-error-text, [id^="cf-chl-"],'
+      + ' .cf-challenge, [data-translate="checking_browser"], [data-translate="verify_you_are_human"]',
+    );
+    if (interstitial && visible(interstitial)) return "interstitial challenge node";
+
+    // The interstitial document (not the normal app) lives under the
+    // challenge-platform path or carries a `__cf_chl` token.
+    const path = `${location.pathname}${location.search}`;
+    if (/\/cdn-cgi\/challenge-platform\//.test(path) || /__cf_chl|cf_chl_/.test(path)) {
+      return "challenge url";
+    }
+    return undefined;
+  }).catch(() => undefined);
+}
+
+/**
+ * Wait, up to `timeoutMs`, for a real-Chrome challenge to clear on its own.
+ * Managed (non-interactive) challenges usually resolve in a few seconds. Returns
+ * the lingering signal when it never clears.
+ */
+export async function waitForCloudflareChallengeToClear(
+  page: Page,
+  timeoutMs = 30_000,
+): Promise<string | undefined> {
+  let signal = await chatGptCloudflareChallengeSignal(page);
+  if (!signal) return undefined;
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    await page.waitForTimeout(500).catch(() => undefined);
+    signal = await chatGptCloudflareChallengeSignal(page);
+    if (!signal) return undefined;
+  }
+  return signal;
+}
+
+/** Throw the shared Cloudflare challenge error when the page is challenged. */
+export async function assertNoChatGptCloudflareChallenge(
+  page: Page,
+  timeoutMs = 30_000,
+): Promise<void> {
+  const signal = await waitForCloudflareChallengeToClear(page, timeoutMs);
+  if (signal) throw new Error(chatGptCloudflareChallengeMessage(signal));
+}
+
+/** Compose the actionable challenge error, preserving the detected signal. */
+export function chatGptCloudflareChallengeMessage(signal: string): string {
+  return `${CLOUDFLARE_CHALLENGE_MESSAGE} (detected: ${signal})`;
+}
+
+/** True when an error thrown by this module is the Cloudflare challenge error. */
+export function isChatGptCloudflareChallengeMessage(message: string): boolean {
+  return cloudflareChallengeSignal(message) !== undefined;
+}
+
 async function anyVisible(locator: Locator): Promise<boolean> {
   return locator.evaluateAll(elements => elements.some(element => {
     const candidate = element as HTMLElement;
@@ -94,6 +188,11 @@ export async function assertAuthenticatedChatGptPage(page: Page): Promise<void> 
   if (isGoogleAccountSignInUrl(page.url())) {
     throw new Error(GOOGLE_SECURE_BROWSER_RELOGIN_MESSAGE);
   }
+
+  // A challenge interstitial hides the composer and previously produced a
+  // misleading "no visible composer" error. Report the real cause instead.
+  const challenge = await chatGptCloudflareChallengeSignal(page);
+  if (challenge) throw new Error(chatGptCloudflareChallengeMessage(challenge));
 
   // Current ChatGPT no longer guarantees the old profile/account button or the
   // old "Chat with ChatGPT" accessible name. The visible composer is the stable

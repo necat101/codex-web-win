@@ -6,8 +6,16 @@ import type { AppConfig } from "./config";
 import { atomicWriteFile } from "./config";
 import { childProcessEnvironment } from "./process";
 import {
+  applyAutomationSignalSuppression,
+  automationSuppressionIgnoredArgs,
+  automationSuppressionLaunchArgs,
+} from "./browser-automation-signals";
+import {
   assertAuthenticatedChatGptPage,
+  assertNoChatGptCloudflareChallenge,
   assertTemporaryChatPage,
+  chatGptCloudflareChallengeMessage,
+  chatGptCloudflareChallengeSignal,
   CHATGPT_COMPOSER_SELECTOR,
   CHATGPT_TEMPORARY_CHAT_URL,
   detectChatGptProCapability,
@@ -38,6 +46,11 @@ export function loginVerificationMarkerPath(storageStatePath: string): string {
 // manual login window. Google credential entry still happens only in the first,
 // non-Playwright Chrome process below.
 export const CHATGPT_LOGIN_VERIFICATION_HEADLESS = false;
+
+// The post-login verification browser is visible on purpose. If ChatGPT's edge
+// serves an interactive challenge there, give the user real time to clear it in
+// that open window before failing closed, instead of aborting immediately.
+export const CHATGPT_LOGIN_CHALLENGE_CLEAR_MS = 120_000;
 
 export function normalChromeLoginArguments(profileDir: string): string[] {
   // Google OAuth's secure-browser policy prohibits credential entry in an
@@ -72,18 +85,34 @@ async function inspectStoredState(
     executablePath: config.chromeExecutablePath,
     headless: CHATGPT_LOGIN_VERIFICATION_HEADLESS,
     env: childProcessEnvironment(),
-    ignoreDefaultArgs: ["--password-store=basic", "--use-mock-keychain"],
-    args: ["--no-first-run", "--no-default-browser-check"],
+    ignoreDefaultArgs: [
+      "--password-store=basic",
+      "--use-mock-keychain",
+      ...automationSuppressionIgnoredArgs(),
+    ],
+    args: ["--no-first-run", "--no-default-browser-check", ...automationSuppressionLaunchArgs()],
   });
   try {
     const verifierContext = await verifierBrowser.newContext({ storageState });
+    // Cloudflare loops the challenge on an automation-advertising browser; these
+    // masks stop Chrome identifying itself as controlled. They never solve it.
+    await applyAutomationSignalSuppression(verifierContext);
     try {
       const verifierPage = await verifierContext.newPage();
       await verifierPage.goto(CHATGPT_TEMPORARY_CHAT_URL, { waitUntil: "domcontentloaded", timeout: 60_000 });
       if (isGoogleAccountSignInUrl(verifierPage.url())) {
         throw new Error(GOOGLE_SECURE_BROWSER_RELOGIN_MESSAGE);
       }
-      await verifierPage.locator(CHATGPT_COMPOSER_SELECTOR).filter({ visible: true }).first().waitFor({ state: "visible", timeout: 60_000 });
+      // A challenge interstitial hides the composer; report the real cause
+      // instead of a misleading 60s "composer never appeared" timeout.
+      await assertNoChatGptCloudflareChallenge(verifierPage, CHATGPT_LOGIN_CHALLENGE_CLEAR_MS);
+      try {
+        await verifierPage.locator(CHATGPT_COMPOSER_SELECTOR).filter({ visible: true }).first().waitFor({ state: "visible", timeout: 60_000 });
+      } catch (error) {
+        const challenge = await chatGptCloudflareChallengeSignal(verifierPage);
+        if (challenge) throw new Error(chatGptCloudflareChallengeMessage(challenge));
+        throw error;
+      }
       await assertAuthenticatedChatGptPage(verifierPage);
       await assertTemporaryChatPage(verifierPage);
       return { proAvailable: await detectChatGptProCapability(verifierPage), url: verifierPage.url() };
@@ -271,10 +300,15 @@ export async function loginToChatGpt(
       executablePath: config.chromeExecutablePath,
       headless: CHATGPT_LOGIN_VERIFICATION_HEADLESS,
       env: childProcessEnvironment(),
-      ignoreDefaultArgs: ["--password-store=basic", "--use-mock-keychain"],
-      args: ["--no-first-run", "--no-default-browser-check"],
+      ignoreDefaultArgs: [
+        "--password-store=basic",
+        "--use-mock-keychain",
+        ...automationSuppressionIgnoredArgs(),
+      ],
+      args: ["--no-first-run", "--no-default-browser-check", ...automationSuppressionLaunchArgs()],
     });
 
+    await applyAutomationSignalSuppression(context);
     const page = context.pages()[0] ?? await context.newPage();
     await page.goto(CHATGPT_TEMPORARY_CHAT_URL, {
       waitUntil: "domcontentloaded",
@@ -283,10 +317,13 @@ export async function loginToChatGpt(
     if (isGoogleAccountSignInUrl(page.url())) {
       throw new Error(GOOGLE_SECURE_BROWSER_RELOGIN_MESSAGE);
     }
+    await assertNoChatGptCloudflareChallenge(page, CHATGPT_LOGIN_CHALLENGE_CLEAR_MS);
     // CODEX_WEB_WIN_CHATGPT_UI_2026_09_25_V7
     const composer = page.locator(CHATGPT_COMPOSER_SELECTOR).filter({ visible: true }).first();    try {
       await composer.waitFor({ state: "visible", timeout: options.timeoutMs ?? 60_000 });
     } catch {
+      const challenge = await chatGptCloudflareChallengeSignal(page);
+      if (challenge) throw new Error(chatGptCloudflareChallengeMessage(challenge));
       throw new Error(
         "The normal Chrome login window was closed before ChatGPT authentication was complete. "
         + `${GOOGLE_SECURE_BROWSER_RELOGIN_MESSAGE}`,

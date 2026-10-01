@@ -1,3 +1,5 @@
+import { CLOUDFLARE_CHALLENGE_CODE, cloudflareChallengeSignal } from "../cloudflare-challenge";
+
 export interface CodexErrorPayload {
   message: string;
   type: string;
@@ -88,6 +90,12 @@ export function classifyError(status: number, type: string, message: string): Co
     isClientClosedMessage(text)
   ) {
     return { message, type: "invalid_request_error", code: "client_closed_request" };
+  }
+  // A Cloudflare/edge challenge is terminal: the ChatGPT backend refused this
+  // automated traffic, and retrying the identical request never clears it. Keep
+  // the explicit machine code so it survives into /api/logs and the error frame.
+  if (cloudflareChallengeSignal(message)) {
+    return { message, type: "invalid_request_error", code: CLOUDFLARE_CHALLENGE_CODE };
   }
   if (
     text.includes("context_length_exceeded") ||
@@ -195,6 +203,9 @@ export function inferHttpStatusFromAdapterMessage(message: string): number {
   const lower = message.toLowerCase();
   // Client aborts (e.g. mid web-search loop) must not look like upstream 502s in /api/logs.
   if (isClientClosedMessage(lower)) return 499;
+  // A challenge is an upstream refusal, not a malformed request; map it to a
+  // permission-style status so it is not retried as a transient 5xx.
+  if (cloudflareChallengeSignal(lower)) return 403;
   if (
     lower.includes("resource_exhausted") ||
     lower.includes("resource exhausted") ||
@@ -263,6 +274,7 @@ export function httpStatusFromTerminalError(error: {
 } | undefined): number {
   if (!error) return 502;
   if (error.code === "client_closed_request" || error.code === "client_cancelled") return 499;
+  if (error.code === CLOUDFLARE_CHALLENGE_CODE) return 403;
   if (error.type === "rate_limit_error" || error.code === "rate_limit_exceeded") return 429;
   if (error.type === "authentication_error" || error.code === "invalid_api_key") return 401;
   if (
