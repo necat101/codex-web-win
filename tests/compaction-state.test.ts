@@ -314,6 +314,42 @@ describe("ChatGPT Web compaction continuation", () => {
     expect(chatGptTurnExecutionFamilyKey(first)).toBe(chatGptTurnExecutionFamilyKey(preCompaction));
   });
 
+  test("keeps one browser turn family when native thread_id rotates across a compaction window handoff", () => {
+    const compactedSummary = `${SUMMARY_PREFIX}\nwindow-handoff checkpoint`;
+    const before = parseRequest({
+      model: "chatgpt-web/high",
+      reasoning: { effort: "high" },
+      client_metadata: {
+        "x-codex-turn-metadata": JSON.stringify({
+          thread_id: "thread_before_window_rotation",
+          turn_id: "turn_window_rotation",
+          sandbox_mode: "danger-full-access",
+        }),
+      },
+      input: [{ type: "message", id: "msg_before_window", role: "user", content: [{ type: "input_text", text: "before" }] }],
+    });
+    const after = parseRequest({
+      model: "chatgpt-web/high",
+      reasoning: { effort: "high" },
+      client_metadata: {
+        "x-codex-turn-metadata": JSON.stringify({
+          thread_id: "thread_after_window_rotation",
+          parent_thread_id: "thread_before_window_rotation",
+          turn_id: "turn_window_rotation",
+          sandbox_mode: "danger-full-access",
+        }),
+      },
+      input: [
+        { type: "message", role: "user", content: [{ type: "input_text", text: compactedSummary }] },
+        { type: "message", id: "msg_after_window", role: "user", content: [{ type: "input_text", text: "continue after window rotation" }] },
+      ],
+    });
+
+    expect(after._contextCompactionEpoch).toBeDefined();
+    expect(chatGptTurnExecutionFamilyKey(after)).toBe(chatGptTurnExecutionFamilyKey(before));
+    expect(chatGptTurnExecutionKey(after)).not.toBe(chatGptTurnExecutionKey(before));
+  });
+
   test("cancels the prior browser epoch before starting its compacted replacement", () => {
     const sessions = new ChatGptTurnSessions();
     const cancelled: string[] = [];
@@ -474,6 +510,330 @@ describe("ChatGPT Web compaction continuation", () => {
     expect(head.text).toContain("begin-");
     expect(tail.matched).toBe(true);
     expect(tail.text).toContain("-end");
+  });
+
+  test("builds a structured recent handoff without replaying the compaction control prompt", async () => {
+    const input = Array.from({ length: 30 }, (_, index) => ({
+      type: "message",
+      role: index % 2 === 0 ? "user" : "assistant",
+      content: [{ type: "input_text", text: `history-item-${index}` }],
+    }));
+    input.push({
+      type: "function_call_output",
+      call_id: "call_large_recent",
+      output: `large-start-${"z".repeat(80_000)}-large-end`,
+    } as never);
+    input.push({
+      type: "message",
+      role: "user",
+      content: [{ type: "input_text", text: "LATEST ACTIVE TASK MUST SURVIVE" }],
+    });
+    input.push({
+      type: "message",
+      role: "user",
+      content: [{ type: "input_text", text: COMPACT_PROMPT }],
+    });
+
+    const snapshot = await createLocalCompactionSnapshot({
+      model: "chatgpt-web/high",
+      previous_response_id: "resp_before_compaction",
+      input,
+    }, { kind: "responses-local", model: "chatgpt-web/high" });
+
+    const recentMatch = /<recent_history_tail>\n([\s\S]*?)\n<\/recent_history_tail>/.exec(snapshot.manifest);
+    expect(recentMatch?.[1]).toBeDefined();
+    const handoff = JSON.parse(recentMatch![1]!) as {
+      input_count: number;
+      omitted_input_items: number;
+      continuation: {
+        order: string;
+        recent_input_start_index: number;
+        latest_user_item_index: number | null;
+        latest_tool_result_item_index: number | null;
+        resume_rule: string;
+      };
+      recent_input: unknown[];
+    };
+    const serialized = JSON.stringify(handoff);
+    expect(handoff.input_count).toBe(32);
+    expect(handoff.omitted_input_items).toBeGreaterThan(0);
+    expect(handoff.recent_input.length).toBeLessThanOrEqual(24);
+    expect(handoff.continuation.order).toBe("oldest_to_newest");
+    expect(handoff.continuation.latest_user_item_index).toBe(31);
+    expect(handoff.continuation.latest_tool_result_item_index).toBe(30);
+    expect(handoff.continuation.recent_input_start_index).toBe(handoff.omitted_input_items);
+    expect(handoff.continuation.resume_rule).toContain("fresh browser window");
+    expect(serialized).toContain("LATEST ACTIVE TASK MUST SURVIVE");
+    expect(serialized).toContain("large-start-");
+    expect(serialized).toContain("large-end");
+    expect(serialized).toContain("handoff field shortened");
+    expect(serialized).not.toContain("CONTEXT CHECKPOINT COMPACTION");
+    expect(snapshot.recentChars).toBeLessThanOrEqual(32_000);
+  });
+
+  test("preserves the omitted assistant and tool boundary immediately before the recent suffix", async () => {
+    const input: unknown[] = [
+      {
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: "ROOT REQUEST FOR BOUNDARY HANDOFF" }],
+      },
+      {
+        type: "message",
+        role: "assistant",
+        content: [{ type: "output_text", text: "BOUNDARY ASSISTANT STATE" }],
+      },
+      {
+        type: "custom_tool_call_output",
+        call_id: "call_boundary",
+        output: "BOUNDARY TOOL RESULT",
+      },
+      ...Array.from({ length: 24 }, (_, index) => ({
+        type: "custom_tool_call_output",
+        call_id: `call_recent_boundary_${index}`,
+        output: `recent-${index}`,
+      })),
+    ];
+
+    const snapshot = await createLocalCompactionSnapshot({
+      model: "chatgpt-web/high",
+      input,
+    }, { kind: "responses-local", model: "chatgpt-web/high" });
+    const recentMatch = /<recent_history_tail>\n([\s\S]*?)\n<\/recent_history_tail>/.exec(snapshot.manifest);
+    const handoff = JSON.parse(recentMatch![1]!) as {
+      boundary_context?: Array<{ index: number; type: string; excerpt: string }>;
+      continuation: { recent_input_start_index: number };
+    };
+
+    expect(handoff.continuation.recent_input_start_index).toBe(3);
+    expect(handoff.boundary_context?.map(item => item.index)).toEqual([1, 2]);
+    expect(handoff.boundary_context?.[0]?.excerpt).toContain("BOUNDARY ASSISTANT STATE");
+    expect(handoff.boundary_context?.[1]?.excerpt).toContain("BOUNDARY TOOL RESULT");
+    expect(snapshot.recentChars).toBeLessThanOrEqual(32_000);
+  });
+
+  test("anchors the active user request when later tool traffic evicts it from the recent suffix", async () => {
+    const input: unknown[] = [{
+      type: "message",
+      role: "user",
+      content: [{ type: "input_text", text: "ACTIVE REQUEST ANCHOR MUST SURVIVE TOOL TRAFFIC" }],
+    }];
+    for (let index = 0; index < 30; index++) {
+      input.push({
+        type: "custom_tool_call_output",
+        call_id: `call_anchor_${index}`,
+        output: `tool-result-${index}-${"x".repeat(200)}`,
+      });
+    }
+
+    const snapshot = await createLocalCompactionSnapshot({
+      model: "chatgpt-web/high",
+      input,
+    }, { kind: "responses-local", model: "chatgpt-web/high" });
+    const recentMatch = /<recent_history_tail>\n([\s\S]*?)\n<\/recent_history_tail>/.exec(snapshot.manifest);
+    expect(recentMatch?.[1]).toBeDefined();
+    const handoff = JSON.parse(recentMatch![1]!) as {
+      active_request?: { index: number; text: string };
+      continuation: { active_user_item_index: number | null; recent_input_start_index: number };
+      recent_input: unknown[];
+    };
+
+    expect(handoff.continuation.recent_input_start_index).toBeGreaterThan(0);
+    expect(JSON.stringify(handoff.recent_input)).not.toContain("ACTIVE REQUEST ANCHOR MUST SURVIVE TOOL TRAFFIC");
+    expect(handoff.continuation.active_user_item_index).toBe(0);
+    expect(handoff.active_request?.index).toBe(0);
+    expect(handoff.active_request?.text).toContain("ACTIVE REQUEST ANCHOR MUST SURVIVE TOOL TRAFFIC");
+    expect(snapshot.recentChars).toBeLessThanOrEqual(32_000);
+  });
+
+  test("anchors the latest omitted public assistant state across a tool-heavy fresh-window handoff", async () => {
+    const input: unknown[] = [
+      {
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: "ROOT TASK FOR ASSISTANT STATE HANDOFF" }],
+      },
+      {
+        type: "message",
+        role: "assistant",
+        content: [
+          { type: "output_text", text: "PUBLIC PROGRESS: root cause isolated; validation is the remaining step." },
+          { type: "reasoning", text: "PRIVATE REASONING MUST NOT ENTER THE HANDOFF" },
+        ],
+      },
+      ...Array.from({ length: 30 }, (_, index) => ({
+        type: "custom_tool_call_output",
+        call_id: `call_assistant_state_${index}`,
+        output: `tool-result-${index}-${"x".repeat(200)}`,
+      })),
+    ];
+
+    const snapshot = await createLocalCompactionSnapshot({
+      model: "chatgpt-web/high",
+      input,
+    }, { kind: "responses-local", model: "chatgpt-web/high" });
+    const recentMatch = /<recent_history_tail>\n([\s\S]*?)\n<\/recent_history_tail>/.exec(snapshot.manifest);
+    expect(recentMatch?.[1]).toBeDefined();
+    const handoff = JSON.parse(recentMatch![1]!) as {
+      assistant_state?: { index: number; text: string };
+      recent_input: unknown[];
+    };
+
+    expect(JSON.stringify(handoff.recent_input)).not.toContain("PUBLIC PROGRESS");
+    expect(handoff.assistant_state?.index).toBe(1);
+    expect(handoff.assistant_state?.text).toContain("PUBLIC PROGRESS: root cause isolated");
+    expect(handoff.assistant_state?.text).not.toContain("PRIVATE REASONING");
+    expect(snapshot.recentChars).toBeLessThanOrEqual(32_000);
+  });
+
+  test("does not replace the active request anchor with a native skill-context user item", async () => {
+    const input: unknown[] = [
+      {
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: "REAL USER REQUEST BEFORE SKILL CONTEXT" }],
+      },
+      {
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: "<skill>internal native skill context</skill>" }],
+      },
+      ...Array.from({ length: 30 }, (_, index) => ({
+        type: "function_call_output",
+        call_id: `call_skill_anchor_${index}`,
+        output: `result-${index}`,
+      })),
+    ];
+
+    const snapshot = await createLocalCompactionSnapshot({
+      model: "chatgpt-web/high",
+      input,
+    }, { kind: "responses-local", model: "chatgpt-web/high" });
+    const recentMatch = /<recent_history_tail>\n([\s\S]*?)\n<\/recent_history_tail>/.exec(snapshot.manifest);
+    const handoff = JSON.parse(recentMatch![1]!) as {
+      active_request?: { index: number; text: string };
+      continuation: { active_user_item_index: number | null };
+    };
+    expect(handoff.continuation.active_user_item_index).toBe(0);
+    expect(handoff.active_request?.index).toBe(0);
+    expect(handoff.active_request?.text).toContain("REAL USER REQUEST BEFORE SKILL CONTEXT");
+    expect(handoff.active_request?.text).not.toContain("internal native skill context");
+  });
+
+  test("preserves older user steering when a later short user message is also evicted by tool traffic", async () => {
+    const input: unknown[] = [
+      {
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: "ORIGINAL SUBSTANTIVE TASK WITH IMPORTANT CONSTRAINTS" }],
+      },
+      {
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: "<environment_context>native context must not become a request anchor</environment_context>" }],
+      },
+      {
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: "STATUS CHECK BUT KEEP DOING THE ORIGINAL TASK" }],
+      },
+      ...Array.from({ length: 30 }, (_, index) => ({
+        type: "custom_tool_call_output",
+        call_id: `call_multi_anchor_${index}`,
+        output: `result-${index}`,
+      })),
+    ];
+
+    const snapshot = await createLocalCompactionSnapshot({
+      model: "chatgpt-web/high",
+      input,
+    }, { kind: "responses-local", model: "chatgpt-web/high" });
+    const recentMatch = /<recent_history_tail>\n([\s\S]*?)\n<\/recent_history_tail>/.exec(snapshot.manifest);
+    const handoff = JSON.parse(recentMatch![1]!) as {
+      request_anchors?: Array<{ index: number; text: string }>;
+      active_request?: { index: number; text: string };
+      recent_input: unknown[];
+    };
+
+    expect(JSON.stringify(handoff.recent_input)).not.toContain("ORIGINAL SUBSTANTIVE TASK");
+    expect(handoff.request_anchors?.map(anchor => anchor.index)).toEqual([0, 2]);
+    expect(handoff.request_anchors?.[0]?.text).toContain("ORIGINAL SUBSTANTIVE TASK WITH IMPORTANT CONSTRAINTS");
+    expect(handoff.request_anchors?.[1]?.text).toContain("STATUS CHECK BUT KEEP DOING THE ORIGINAL TASK");
+    expect(JSON.stringify(handoff.request_anchors)).not.toContain("native context must not become a request anchor");
+    expect(handoff.active_request?.index).toBe(2);
+    expect(snapshot.recentChars).toBeLessThanOrEqual(32_000);
+  });
+
+  test("keeps the original task anchor after many later user steering messages are evicted", async () => {
+    const input: unknown[] = [
+      {
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: "ORIGINAL TASK ROOT MUST SURVIVE MANY FOLLOW UPS" }],
+      },
+      ...Array.from({ length: 5 }, (_, index) => ({
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: `later-steering-${index}` }],
+      })),
+      ...Array.from({ length: 30 }, (_, index) => ({
+        type: "custom_tool_call_output",
+        call_id: `call_many_anchors_${index}`,
+        output: `result-${index}`,
+      })),
+    ];
+
+    const snapshot = await createLocalCompactionSnapshot({
+      model: "chatgpt-web/high",
+      input,
+    }, { kind: "responses-local", model: "chatgpt-web/high" });
+    const recentMatch = /<recent_history_tail>\n([\s\S]*?)\n<\/recent_history_tail>/.exec(snapshot.manifest);
+    const handoff = JSON.parse(recentMatch![1]!) as {
+      request_anchors?: Array<{ index: number; text: string }>;
+      active_request?: { index: number; text: string };
+    };
+
+    expect(handoff.request_anchors?.map(anchor => anchor.index)).toEqual([0, 4, 5]);
+    expect(handoff.request_anchors?.[0]?.text).toContain("ORIGINAL TASK ROOT MUST SURVIVE MANY FOLLOW UPS");
+    expect(handoff.request_anchors?.[1]?.text).toContain("later-steering-3");
+    expect(handoff.request_anchors?.[2]?.text).toContain("later-steering-4");
+    expect(handoff.active_request?.index).toBe(5);
+  });
+
+  test("does not manufacture an active request from Codex-injected user context", async () => {
+    const input: unknown[] = [
+      {
+        type: "message",
+        role: "user",
+        content: [{ type: "input_text", text: "<environment_context>injected environment only</environment_context>" }],
+      },
+      {
+        type: "message",
+        role: "user",
+        metadata: { client_authored: false },
+        content: [{ type: "input_text", text: "internal continuation context" }],
+      },
+      ...Array.from({ length: 30 }, (_, index) => ({
+        type: "function_call_output",
+        call_id: `call_internal_only_${index}`,
+        output: `result-${index}`,
+      })),
+    ];
+
+    const snapshot = await createLocalCompactionSnapshot({
+      model: "chatgpt-web/high",
+      input,
+    }, { kind: "responses-local", model: "chatgpt-web/high" });
+    const recentMatch = /<recent_history_tail>\n([\s\S]*?)\n<\/recent_history_tail>/.exec(snapshot.manifest);
+    const handoff = JSON.parse(recentMatch![1]!) as {
+      active_request?: { index: number; text: string };
+      request_anchors?: Array<{ index: number; text: string }>;
+      continuation: { active_user_item_index: number | null };
+    };
+
+    expect(handoff.continuation.active_user_item_index).toBeNull();
+    expect(handoff.active_request).toBeUndefined();
+    expect(handoff.request_anchors).toBeUndefined();
   });
 
   test("restores a local checkpoint through previous_response_id", async () => {

@@ -23,9 +23,21 @@ describe("ChatGPT Web transport contract", () => {
 
     expect(compiled.text).toContain("call codex_bind_turn");
     expect(compiled.text).toContain("dangerFullAccess");
+    expect(compiled.text).toContain("codex_inspect");
+    expect(compiled.text).toContain("fresh ChatGPT browser window");
+    expect(compiled.text).toContain("request_anchors");
+    expect(compiled.text).toContain("active_request");
+    expect(compiled.text).toContain("assistant_state");
+    expect(compiled.text).toContain("boundary_context");
+    expect(compiled.text).toContain("preserved user-goal anchor");
     expect(compiled.text).toContain("codex_tool_inventory");
     expect(compiled.text).toContain("before concluding local command execution is unavailable");
+    expect(compiled.text).toContain("codex_wait_session");
+    expect(compiled.text).toContain("wait-cell:N");
+    expect(compiled.text).toContain("codex_read_compaction");
     expect(compiled.text).toContain("__bridge_read_compaction");
+    expect(compiled.text).toContain("compound shell command");
+    expect(compiled.text).toContain("explicit native policy");
     expect(compiled.text).toContain("CODEX_SHARED_TUNNEL_ROUTE_MISS");
     expect(compiled.text).toContain("up to 8 additional times");
     expect(compiled.text).toContain("outer dispatch refusal");

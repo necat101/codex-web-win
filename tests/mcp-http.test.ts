@@ -29,9 +29,20 @@ describe("legacy Codex Native HTTP MCP compatibility", () => {
       const tools = await client.listTools();
       const names = new Set(tools.tools.map(tool => tool.name));
       expect(names.has("codex_bind_turn")).toBe(true);
+      expect(names.has("codex_inspect")).toBe(true);
       expect(names.has("codex_exec")).toBe(true);
+      expect(names.has("codex_wait_session")).toBe(true);
+      expect(names.has("codex_read_compaction")).toBe(true);
       expect(names.has("codex_tool_inventory")).toBe(true);
       expect(names.has("codex_tool_call")).toBe(true);
+      const inspect = tools.tools.find(tool => tool.name === "codex_inspect");
+      expect(inspect?.annotations?.readOnlyHint).toBe(true);
+      expect(inspect?.annotations?.destructiveHint).toBe(false);
+      const wait = tools.tools.find(tool => tool.name === "codex_wait_session");
+      expect(wait?.annotations?.readOnlyHint).toBe(true);
+      expect(wait?.annotations?.destructiveHint).toBe(false);
+      const exec = tools.tools.find(tool => tool.name === "codex_exec");
+      expect(exec?.annotations?.destructiveHint).toBe(true);
     } finally {
       await client.close();
       await server.stop();

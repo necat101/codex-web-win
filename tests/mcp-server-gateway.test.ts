@@ -6,6 +6,7 @@ import {
   GatewayInventoryCache,
   GatewayInventoryLastKnownGood,
   isPotentialNonOwnerBrokerError,
+  isOuterDispatchClassifierRefusal,
   execGatewayCommandProgram,
   GATEWAY_WAIT_CELL_SESSION_PREFIX,
   execGatewayProgram,
@@ -36,6 +37,25 @@ function execGateway(description: string): CodexTool {
 }
 
 describe("Codex exec gateway discovery", () => {
+  test("recognizes only the pre-native host safety-classifier refusal for gateway retry", () => {
+    expect(isOuterDispatchClassifierRefusal({
+      isError: true,
+      content: [{ type: "text", text: "This tool call was blocked by OpenAI's safety checks. Please double check what you are sending." }],
+    })).toBe(true);
+    expect(isOuterDispatchClassifierRefusal({
+      isError: false,
+      content: [{ type: "text", text: "This tool call was blocked by OpenAI's safety checks. Please double check what you are sending." }],
+    })).toBe(false);
+    expect(isOuterDispatchClassifierRefusal({
+      isError: true,
+      content: [{ type: "text", text: "Command refused by native sandbox policy; approval is required." }],
+    })).toBe(false);
+    expect(isOuterDispatchClassifierRefusal({
+      isError: true,
+      content: [{ type: "text", text: "This command is not permitted by the native execution policy." }],
+    })).toBe(false);
+  });
+
   test("retains the last non-empty gateway inventory across a transient empty refresh", () => {
     const inventory = new GatewayInventoryLastKnownGood();
     const declared = parseGatewayRuntimeTools([
